@@ -5,29 +5,60 @@ const Jimp = require('jimp');
 const Database = require('better-sqlite3');
 const fs = require('fs');
 
-// ═══════════════════════════════════════════════
-//  CONFIG
-// ═══════════════════════════════════════════════
-const ADMIN_ID            = 7126311531;
-const CHANNEL_ID          = -1002693570480;
-const MAX_SIGNALS_PER_DAY = 5;
-const SCAN_INTERVAL_MS    = 15 * 60 * 1000;
+// ── NEW: GramJS (optional — loaded lazily so bot still runs if not installed yet) ──
+let TelegramClient, StringSession, NewMessage, GRAMJS_AVAILABLE = false;
+try {
+  ({ TelegramClient } = require('telegram'));
+  ({ StringSession } = require('telegram/sessions'));
+  ({ NewMessage } = require('telegram/events'));
+  GRAMJS_AVAILABLE = true;
+} catch (e) {
+  console.log('[GramJS] "telegram" package ba a samu ba — Alpha Group Listener zai kasance OFF. Yi "npm install telegram" idan kana son wannan feature.');
+}
 
-// ── Filters ──
-const MIN_AGE_HOURS  = 1;
-const MAX_AGE_HOURS  = 12;
-const MIN_MC         = 20000;
-const MAX_MC         = 500000;
-const MIN_LIQUIDITY  = 3000;
-const MIN_VOLUME_24H = 500;
-const MAX_RUG_SCORE  = 800;
-const SCORE_PASS_MIN = 35;
+// ═══════════════════════════════════════════════════════════
+//  YakubuWeb3 Signal Bot — v2
+//  + Smart Wallet Tracking (curated + auto-verified)
+//  + Telegram Alpha-Group Listener (GramJS)
+//  + Crowdsourced Wallet Submission + Auto-Verification
+//  + AI Explanation Layer
+//  NEW ENV VARS NEEDED — see .env.example
+// ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════════
+const ADMIN_ID           = 7126311531;
+const CHANNEL_ID         = -1002693570480;
+const MAX_SIGNALS_PER_DAY = 5;
+const SCAN_INTERVAL_MS   = 30 * 60 * 1000;
+const MIN_LIQUIDITY      = 5000;
+const MIN_AGE_HOURS      = 1;
+const MAX_AGE_HOURS      = 12;
+const MAX_RUG_SCORE      = 700;
+const SCORE_PASS_MIN     = 55;
+
+// ── NEW: Wallet Tracking / AI / GramJS Config ──
+const SOLANA_RPC_URL        = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const ANTHROPIC_API_KEY     = process.env.ANTHROPIC_API_KEY || '';
+const AI_MODEL              = 'claude-haiku-4-5-20251001';
+const TG_API_ID             = parseInt(process.env.TG_API_ID || '0');
+const TG_API_HASH           = process.env.TG_API_HASH || '';
+const TG_SESSION            = process.env.TG_SESSION || '';
+const ALPHA_GROUPS          = (process.env.ALPHA_GROUPS || '').split(',').map(s => s.trim()).filter(Boolean); // numeric chat IDs
+const CURATED_WALLETS       = (process.env.CURATED_WALLETS || '').split(',').map(s => s.trim()).filter(Boolean);
+const WALLET_CHECK_INTERVAL_MS     = 5 * 60 * 1000;
+const SUBMISSION_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+const PREMIUM_REWARD_DAYS          = 5;
+const MIN_WIN_RATE_FOR_VERIFICATION = 50;
+const MIN_TOKENS_FOR_VERIFICATION   = 3;
+const SOLANA_ADDRESS_REGEX = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
 
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 //  DATABASE
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 const db = new Database('tokens.db');
 db.exec(`
   CREATE TABLE IF NOT EXISTS snapshots (
@@ -52,168 +83,168 @@ db.exec(`
     result TEXT, pnl_pct REAL, pnl_sol REAL,
     opened_at INTEGER, closed_at INTEGER
   );
-  CREATE TABLE IF NOT EXISTS pending_signals (
-    ca TEXT PRIMARY KEY,
-    signal_text TEXT,
-    entry_price REAL,
-    target1 REAL,
-    target2 REAL,
-    stop_loss REAL,
-    token_name TEXT,
-    token_symbol TEXT,
-    token_fdv REAL,
-    saved_at INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS user_activity (
-    chat_id TEXT PRIMARY KEY,
-    username TEXT,
-    first_seen INTEGER,
-    last_seen INTEGER,
-    total_analyses INTEGER DEFAULT 0
-  );
-  CREATE TABLE IF NOT EXISTS analysis_log (
+  CREATE TABLE IF NOT EXISTS wallets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT,
-    ca TEXT,
-    timestamp INTEGER
+    address TEXT UNIQUE NOT NULL,
+    source TEXT DEFAULT 'manual',
+    submitted_by TEXT,
+    verification_status TEXT DEFAULT 'pending',
+    success_score INTEGER DEFAULT 0,
+    win_rate REAL DEFAULT 0,
+    total_trades_tracked INTEGER DEFAULT 0,
+    last_checked INTEGER,
+    last_active_at INTEGER,
+    created_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS wallet_submissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wallet_address TEXT,
+    submitted_by TEXT,
+    source TEXT DEFAULT 'manual',
+    status TEXT DEFAULT 'pending',
+    reward_given INTEGER DEFAULT 0,
+    created_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS premium_users (
+    telegram_id TEXT PRIMARY KEY,
+    expires_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS alpha_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ca TEXT, wallet_address TEXT, alpha_score INTEGER,
+    notified INTEGER DEFAULT 0, created_at INTEGER
   );
 `);
 
+const pendingSignals = {};
 let isScanning = false;
 
-// ── Pending Signals DB ──
-function savePendingSignal(ca, data) {
-  try {
-    db.prepare('INSERT OR REPLACE INTO pending_signals (ca, signal_text, entry_price, target1, target2, stop_loss, token_name, token_symbol, token_fdv, saved_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)').run(
-      ca, data.signalText, data.entry, data.t1, data.t2, data.sl,
-      data.p.baseToken.name, data.p.baseToken.symbol, data.p.fdv || 0, Date.now()
-    );
-  } catch(e) { console.error('savePendingSignal error:', e.message); }
-}
-function getPendingSignal(ca) {
-  try { return db.prepare('SELECT * FROM pending_signals WHERE ca = ?').get(ca); } catch(e) { return null; }
-}
-function deletePendingSignal(ca) {
-  try { db.prepare('DELETE FROM pending_signals WHERE ca = ?').run(ca); } catch(e) {}
-}
-function cleanOldPending() {
-  try { db.prepare('DELETE FROM pending_signals WHERE saved_at < ?').run(Date.now() - 12 * 60 * 60 * 1000); } catch(e) {}
-}
-function clearScannedTokens() {
-  try { db.prepare('DELETE FROM scanned_tokens').run(); console.log('Cleared scan cache'); } catch(e) {}
-}
-
-// ── User Analytics Tracking ──
-function trackUserActivity(chatId, username, ca) {
-  try {
-    const id = String(chatId);
-    const now = Date.now();
-    const existing = db.prepare('SELECT * FROM user_activity WHERE chat_id = ?').get(id);
-    if (existing) {
-      db.prepare('UPDATE user_activity SET username = ?, last_seen = ?, total_analyses = total_analyses + 1 WHERE chat_id = ?').run(username || existing.username, now, id);
-    } else {
-      db.prepare('INSERT INTO user_activity (chat_id, username, first_seen, last_seen, total_analyses) VALUES (?, ?, ?, ?, 1)').run(id, username || null, now, now);
-    }
-    db.prepare('INSERT INTO analysis_log (chat_id, ca, timestamp) VALUES (?, ?, ?)').run(id, ca || null, now);
-  } catch(e) { console.error('trackUserActivity error:', e.message); }
-}
-
-function getActiveUsers(sinceMs) {
-  try {
-    const cutoff = Date.now() - sinceMs;
-    const row = db.prepare('SELECT COUNT(DISTINCT chat_id) as cnt FROM analysis_log WHERE timestamp > ?').get(cutoff);
-    return row ? row.cnt : 0;
-  } catch(e) { return 0; }
-}
-
-function getAnalysesCount(sinceMs) {
-  try {
-    const cutoff = Date.now() - sinceMs;
-    const row = db.prepare('SELECT COUNT(*) as cnt FROM analysis_log WHERE timestamp > ?').get(cutoff);
-    return row ? row.cnt : 0;
-  } catch(e) { return 0; }
-}
-
-function getTotalUsers() {
-  try {
-    const row = db.prepare('SELECT COUNT(*) as cnt FROM user_activity').get();
-    return row ? row.cnt : 0;
-  } catch(e) { return 0; }
-}
-
-function getTopUsers(limit) {
-  try {
-    return db.prepare('SELECT username, chat_id, total_analyses FROM user_activity ORDER BY total_analyses DESC LIMIT ?').all(limit || 5);
-  } catch(e) { return []; }
-}
-
-// ── Update bot bio with monthly user count (like Soul Scanner) ──
-async function updateBotBio() {
-  try {
-    const monthlyUsers = getActiveUsers(30 * 24 * 60 * 60 * 1000);
-    const desc = '🚀 YakubuWeb3 Signal Bot — ' + monthlyUsers.toLocaleString() + ' monthly users\n\nSend any Solana CA to analyze! /trending for hot tokens.';
-    await bot.setMyDescription({ description: desc });
-    console.log('Bot bio updated:', monthlyUsers, 'monthly users');
-  } catch(e) { console.error('updateBotBio error:', e.message); }
-}
-
-// ═══════════════════════════════════════════════
-//  DB HELPERS
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  DATABASE HELPERS
+// ═══════════════════════════════════════════════════════════
 function getTodaySignalCount() {
   const today = new Date().toISOString().split('T')[0];
   const row = db.prepare('SELECT COUNT(*) as count FROM signals_sent WHERE date = ?').get(today);
   return row ? row.count : 0;
 }
+
 function recordSignalSent(ca) {
   const today = new Date().toISOString().split('T')[0];
   db.prepare('INSERT INTO signals_sent (ca, date, timestamp) VALUES (?, ?, ?)').run(ca, today, Date.now());
 }
+
 function alreadyScanned(ca) {
   const row = db.prepare('SELECT * FROM scanned_tokens WHERE ca = ?').get(ca);
   if (!row) return false;
-  return (Date.now() - row.last_scanned) < 30 * 60 * 1000;
+  return (Date.now() - row.last_scanned) < 6 * 60 * 60 * 1000;
 }
+
 function markScanned(ca) {
   db.prepare('INSERT OR REPLACE INTO scanned_tokens (ca, last_scanned) VALUES (?, ?)').run(ca, Date.now());
 }
+
 function saveSnapshot(chatId, ca, price, mc, name, symbol) {
-  try { db.prepare('INSERT INTO snapshots (chat_id, ca, price, mc, name, symbol, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)').run(String(chatId), ca, price, mc, name, symbol, Date.now()); } catch(e) {}
+  try {
+    db.prepare('INSERT INTO snapshots (chat_id, ca, price, mc, name, symbol, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)').run(String(chatId), ca, price, mc, name, symbol, Date.now());
+  } catch(e) {}
 }
+
 function getSnapshot(chatId, ca) {
-  try { return db.prepare('SELECT * FROM snapshots WHERE chat_id = ? AND ca = ? ORDER BY timestamp ASC LIMIT 1').get(String(chatId), ca); } catch(e) { return null; }
+  try {
+    return db.prepare('SELECT * FROM snapshots WHERE chat_id = ? AND ca = ? ORDER BY timestamp ASC LIMIT 1').get(String(chatId), ca);
+  } catch(e) { return null; }
 }
+
 function openPaperTrade(ca, name, symbol, entryPrice, entryMc, target1, target2, stopLoss) {
-  try { db.prepare('INSERT INTO paper_trades (ca, name, symbol, entry_price, entry_mc, target1, target2, stop_loss, sol_amount, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)').run(ca, name, symbol, entryPrice, entryMc, target1, target2, stopLoss, 'open', Date.now()); } catch(e) {}
+  try {
+    db.prepare('INSERT INTO paper_trades (ca, name, symbol, entry_price, entry_mc, target1, target2, stop_loss, sol_amount, status, opened_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)').run(ca, name, symbol, entryPrice, entryMc, target1, target2, stopLoss, 'open', Date.now());
+  } catch(e) { console.error('Paper trade error:', e); }
 }
+
 function getOpenTrades() {
-  try { return db.prepare('SELECT * FROM paper_trades WHERE status = ?').all('open'); } catch(e) { return []; }
+  try { return db.prepare('SELECT * FROM paper_trades WHERE status = ?').all('open'); }
+  catch(e) { return []; }
 }
+
 function closePaperTrade(id, result, pnlPct, pnlSol) {
-  try { db.prepare('UPDATE paper_trades SET status = ?, result = ?, pnl_pct = ?, pnl_sol = ?, closed_at = ? WHERE id = ?').run('closed', result, pnlPct, pnlSol, Date.now(), id); } catch(e) {}
+  try {
+    db.prepare('UPDATE paper_trades SET status = ?, result = ?, pnl_pct = ?, pnl_sol = ?, closed_at = ? WHERE id = ?').run('closed', result, pnlPct, pnlSol, Date.now(), id);
+  } catch(e) {}
 }
+
 function getWeeklyStats() {
   try {
     const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
     const trades = db.prepare('SELECT * FROM paper_trades WHERE closed_at > ? AND status = ?').all(weekAgo, 'closed');
-    if (!trades.length) return null;
-    const wins = trades.filter(t => ['T1','T2','T1_partial'].includes(t.result)).length;
-    const totalPnl = trades.reduce((a,b) => a+(b.pnl_sol||0), 0);
-    const best = [...trades].sort((a,b) => (b.pnl_pct||0)-(a.pnl_pct||0))[0];
-    return { total: trades.length, wins, winRate: ((wins/trades.length)*100).toFixed(0), totalPnl: totalPnl.toFixed(3), best };
+    if (trades.length === 0) return null;
+    const wins = trades.filter(t => t.result === 'T1' || t.result === 'T2' || t.result === 'T1_partial').length;
+    const totalPnlSol = trades.reduce((a, b) => a + (b.pnl_sol || 0), 0);
+    const winRate = ((wins / trades.length) * 100).toFixed(0);
+    const bestTrade = [...trades].sort((a, b) => (b.pnl_pct || 0) - (a.pnl_pct || 0))[0];
+    return { total: trades.length, wins, winRate, totalPnlSol: totalPnlSol.toFixed(3), bestTrade };
   } catch(e) { return null; }
 }
 
-// ═══════════════════════════════════════════════
-//  FORMATTERS
-// ═══════════════════════════════════════════════
-function fmt(n) {
-  if (!n) return 'N/A';
-  if (n >= 1e9) return '$' + (n/1e9).toFixed(2) + 'B';
-  if (n >= 1e6) return '$' + (n/1e6).toFixed(2) + 'M';
-  if (n >= 1e3) return '$' + (n/1e3).toFixed(1) + 'K';
-  return '$' + n.toFixed(2);
+// ── NEW: WALLET TRACKING DB HELPERS ─────────────────────────
+function addWalletSubmission(address, source, submittedBy) {
+  try {
+    const exists = db.prepare('SELECT id FROM wallets WHERE address = ?').get(address);
+    if (exists) return;
+    const dup = db.prepare("SELECT id FROM wallet_submissions WHERE wallet_address = ? AND status = 'pending'").get(address);
+    if (dup) return;
+    db.prepare('INSERT INTO wallet_submissions (wallet_address, submitted_by, source, created_at) VALUES (?, ?, ?, ?)').run(address, submittedBy || 'unknown', source, Date.now());
+    console.log('[Wallet] New submission queued: ' + address.slice(0, 6) + '... via ' + source);
+  } catch(e) { console.error('addWalletSubmission error:', e.message); }
 }
+
+function getPendingSubmissions(limit) {
+  return db.prepare('SELECT * FROM wallet_submissions WHERE status = ? ORDER BY created_at ASC LIMIT ?').all('pending', limit || 10);
+}
+
+function markSubmission(id, status) {
+  db.prepare('UPDATE wallet_submissions SET status = ? WHERE id = ?').run(status, id);
+}
+
+function addVerifiedWallet(address, source, submittedBy, winRate, successScore, totalTrades) {
+  db.prepare(`INSERT INTO wallets (address, source, submitted_by, verification_status, win_rate, success_score, total_trades_tracked, last_checked, last_active_at, created_at)
+              VALUES (?, ?, ?, 'verified', ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(address) DO UPDATE SET verification_status='verified', win_rate=excluded.win_rate, success_score=excluded.success_score, total_trades_tracked=excluded.total_trades_tracked, last_checked=excluded.last_checked`)
+    .run(address, source, submittedBy || null, winRate, successScore, totalTrades, Date.now(), Date.now(), Date.now());
+}
+
+function getVerifiedWallets() {
+  return db.prepare("SELECT * FROM wallets WHERE verification_status = 'verified'").all();
+}
+
+function grantPremium(telegramId, days) {
+  const existing = db.prepare('SELECT * FROM premium_users WHERE telegram_id = ?').get(String(telegramId));
+  const base = existing && existing.expires_at > Date.now() ? existing.expires_at : Date.now();
+  const newExpiry = base + days * 24 * 60 * 60 * 1000;
+  db.prepare(`INSERT INTO premium_users (telegram_id, expires_at) VALUES (?, ?)
+              ON CONFLICT(telegram_id) DO UPDATE SET expires_at = excluded.expires_at`).run(String(telegramId), newExpiry);
+  return newExpiry;
+}
+
+function isPremium(telegramId) {
+  const row = db.prepare('SELECT * FROM premium_users WHERE telegram_id = ?').get(String(telegramId));
+  return !!(row && row.expires_at > Date.now());
+}
+
+function logAlphaSignal(ca, walletAddress, alphaScore) {
+  db.prepare('INSERT INTO alpha_signals (ca, wallet_address, alpha_score, created_at) VALUES (?, ?, ?, ?)').run(ca, walletAddress, alphaScore, Date.now());
+}
+
+// ═══════════════════════════════════════════════════════════
+//  FORMATTERS
+// ═══════════════════════════════════════════════════════════
+function fmt(num) {
+  if (!num) return 'N/A';
+  if (num >= 1e9) return '$' + (num / 1e9).toFixed(2) + 'B';
+  if (num >= 1e6) return '$' + (num / 1e6).toFixed(2) + 'M';
+  if (num >= 1e3) return '$' + (num / 1e3).toFixed(1) + 'K';
+  return '$' + num.toFixed(2);
+}
+
 function fmtPrice(p) {
   if (!p) return 'N/A';
   const n = parseFloat(p);
@@ -222,536 +253,650 @@ function fmtPrice(p) {
   if (n < 1) return '$' + n.toFixed(4);
   return '$' + n.toLocaleString(undefined, { maximumFractionDigits: 2 });
 }
-function fmtPct(c) {
+
+function fmtChange(c) {
   if (!c && c !== 0) return 'N/A';
-  return (c >= 0 ? '🟢 +' : '🔴 ') + parseFloat(c).toFixed(2) + '%';
-}
-function rugEmoji(s) {
-  if (s === 'N/A') return '⚪ UNKNOWN';
-  const n = Number(s);
-  if (n >= 800) return '🔴 HIGH RISK';
-  if (n >= 500) return '🟡 MODERATE';
-  return '🟢 SAFE';
-}
-function timeAgo(ms) {
-  const mins = Math.floor((Date.now() - ms) / 60000);
-  if (mins < 60) return mins + 'm ago';
-  return Math.floor(mins/60) + 'h ' + (mins%60) + 'm ago';
+  const icon = c >= 0 ? 'UP' : 'DOWN';
+  return icon + ' ' + (c >= 0 ? '+' : '') + parseFloat(c).toFixed(2) + '%';
 }
 
-// ═══════════════════════════════════════════════
-//  API
-// ═══════════════════════════════════════════════
-async function getTokenData(ca) {
-  try {
-    const res = await axios.get('https://api.dexscreener.com/latest/dex/tokens/' + ca, { timeout: 10000 });
-    const pairs = res.data?.pairs;
-    if (!pairs || !pairs.length) return null;
-    const sol = pairs.filter(p => p.chainId === 'solana');
-    if (!sol.length) return null;
-    sol.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
-    return sol[0];
-  } catch(e) { return null; }
+function fmtChangeEmoji(c) {
+  if (!c && c !== 0) return 'N/A';
+  const icon = c >= 0 ? '🟢' : '🔴';
+  return icon + ' ' + (c >= 0 ? '+' : '') + parseFloat(c).toFixed(2) + '%';
 }
+
+function getRugEmoji(score) {
+  if (score === 'N/A') return '⚪ UNKNOWN';
+  const s = Number(score);
+  if (s >= 800) return '🔴 HIGH RISK';
+  if (s >= 500) return '🟡 MODERATE RISK';
+  return '🟢 SAFE';
+}
+
+// ═══════════════════════════════════════════════════════════
+//  API HELPERS
+// ═══════════════════════════════════════════════════════════
+async function getTokenData(ca) {
+  const res = await axios.get('https://api.dexscreener.com/latest/dex/tokens/' + ca);
+  const pairs = res.data.pairs;
+  if (!pairs || pairs.length === 0) return null;
+  pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
+  return pairs[0];
+}
+
 async function getRugcheck(ca) {
   try {
-    const res = await axios.get('https://api.rugcheck.xyz/v1/tokens/' + ca + '/report', { timeout: 8000 });
+    const res = await axios.get('https://api.rugcheck.xyz/v1/tokens/' + ca + '/report');
     return res.data;
   } catch(e) { return null; }
 }
 
-// ═══════════════════════════════════════════════
-//  TRENDING — Solana Hot Tokens
-// ═══════════════════════════════════════════════
-async function getTrendingTokens() {
-  const tokens = [];
+function checkDexPaid(p) {
   try {
-    // Dexscreener trending solana pairs
-    const res = await axios.get('https://api.dexscreener.com/latest/dex/pairs/solana', { timeout: 10000 });
-    const pairs = (res.data?.pairs || [])
-      .filter(p => p.chainId === 'solana' && p.fdv > 0)
-      .sort((a,b) => (b.volume?.h24||0) - (a.volume?.h24||0))
-      .slice(0, 20);
-    pairs.forEach(p => {
-      tokens.push({
-        address: p.baseToken?.address,
-        name: p.baseToken?.name,
-        symbol: p.baseToken?.symbol,
-        price: parseFloat(p.priceUsd || 0),
-        mc: p.fdv || 0,
-        liq: p.liquidity?.usd || 0,
-        vol24: p.volume?.h24 || 0,
-        ch1h: parseFloat(p.priceChange?.h1 || 0),
-        ch24: parseFloat(p.priceChange?.h24 || 0),
-        dex: p.dexId || 'N/A',
-        url: 'https://dexscreener.com/solana/' + p.baseToken?.address
-      });
-    });
-  } catch(e) { console.log('Trending fetch error:', e.message); }
-  return tokens;
+    if (p.boosts && p.boosts.active > 0) return true;
+    if (p.profile) return true;
+    if (p.info && (p.info.header || p.info.openGraph || p.info.description)) return true;
+    return false;
+  } catch(e) { return false; }
 }
 
-// ═══════════════════════════════════════════════
-//  FETCH CANDIDATES — 6 Sources
-// ═══════════════════════════════════════════════
+async function getHolderCount(ca, rugData) {
+  if (rugData?.tokenMeta?.holderCount) return rugData.tokenMeta.holderCount.toLocaleString();
+  if (rugData?.markets?.length > 0) {
+    for (const m of rugData.markets) {
+      if (m.holderCount && m.holderCount > 0) return m.holderCount.toLocaleString();
+    }
+  }
+  if (rugData?.holders?.length > 0) return rugData.holders.length.toLocaleString() + '+';
+  try {
+    const res = await axios.get('https://public-api.birdeye.so/defi/token_overview?address=' + ca, {
+      headers: { 'X-API-KEY': 'public', 'x-chain': 'solana' }, timeout: 5000
+    });
+    if (res.data?.data?.holder > 0) return res.data.data.holder.toLocaleString();
+  } catch(e) {}
+  if (rugData?.topHolders?.length) return rugData.topHolders.length + '+';
+  return 'N/A';
+}
+
 async function fetchCandidateTokens() {
   const results = [];
-
-  // Source 1: Dexscreener solana pairs (best source — sorted by volume)
-  try {
-    const res = await axios.get('https://api.dexscreener.com/latest/dex/pairs/solana', { timeout: 10000 });
-    (res.data?.pairs || []).forEach(p => { if(p.baseToken?.address) results.push(p.baseToken.address); });
-    console.log('S1 dex/solana:', results.length);
-  } catch(e) { console.log('S1 failed:', e.message); }
-
-  // Source 2: Dexscreener boosted
   try {
     const res = await axios.get('https://api.dexscreener.com/token-boosts/top/v1', { timeout: 10000 });
-    (res.data||[]).filter(t => t.chainId==='solana').forEach(t => { if(t.tokenAddress) results.push(t.tokenAddress); });
-    console.log('S2 boosts:', results.length);
-  } catch(e) { console.log('S2 failed:', e.message); }
-
-  // Source 3: Dexscreener latest profiles
+    (res.data || []).filter(t => t.chainId === 'solana').forEach(t => { if (t.tokenAddress) results.push(t.tokenAddress); });
+  } catch(e) {}
   try {
     const res = await axios.get('https://api.dexscreener.com/token-profiles/latest/v1', { timeout: 10000 });
-    (res.data||[]).filter(t => t.chainId==='solana').forEach(t => { if(t.tokenAddress) results.push(t.tokenAddress); });
-    console.log('S3 profiles:', results.length);
-  } catch(e) { console.log('S3 failed:', e.message); }
-
-  // Source 4: Pump.fun latest trades
-  try {
-    const res = await axios.get('https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=last_trade_timestamp&order=DESC&includeNsfw=false', { timeout: 10000 });
-    (res.data||[]).forEach(t => { if(t.mint) results.push(t.mint); });
-    console.log('S4 pump latest:', results.length);
-  } catch(e) { console.log('S4 failed:', e.message); }
-
-  // Source 5: Pump.fun top MC
-  try {
-    const res = await axios.get('https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=market_cap&order=DESC&includeNsfw=false', { timeout: 10000 });
-    (res.data||[]).forEach(t => { if(t.mint) results.push(t.mint); });
-    console.log('S5 pump mc:', results.length);
-  } catch(e) { console.log('S5 failed:', e.message); }
-
-  // Source 6: Dexscreener search — new tokens
-  try {
-    const res = await axios.get('https://api.dexscreener.com/latest/dex/search?q=new', { timeout: 10000 });
-    (res.data?.pairs||[]).filter(p => p.chainId==='solana').forEach(p => { if(p.baseToken?.address) results.push(p.baseToken.address); });
-    console.log('S6 dex new:', results.length);
-  } catch(e) { console.log('S6 failed:', e.message); }
-
-  const unique = [...new Set(results)];
-  console.log('Total unique candidates:', unique.length);
-  return unique;
+    (res.data || []).filter(t => t.chainId === 'solana').forEach(t => { if (t.tokenAddress) results.push(t.tokenAddress); });
+  } catch(e) {}
+  return [...new Set(results)];
 }
 
-// ═══════════════════════════════════════════════
-//  DEX ANALYSIS ENGINE
-// ═══════════════════════════════════════════════
+// ── NEW: SOLANA RPC HELPERS (Wallet Tracking) ───────────────
+async function rpcCall(method, params) {
+  try {
+    const res = await axios.post(SOLANA_RPC_URL, { jsonrpc: '2.0', id: 1, method, params }, { timeout: 12000 });
+    if (res.data?.error) { return null; }
+    return res.data?.result || null;
+  } catch(e) { return null; }
+}
+
+async function getWalletRecentSignatures(address, limit) {
+  return await rpcCall('getSignaturesForAddress', [address, { limit: limit || 25 }]);
+}
+
+async function getParsedTransaction(signature) {
+  return await rpcCall('getTransaction', [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
+}
+
+// Heuristic: scan recent signatures for SPL token balance increases owned by `address` (i.e. buys)
+async function getWalletRecentTokenBuys(address, txLimit) {
+  const sigs = await getWalletRecentSignatures(address, txLimit || 25);
+  if (!sigs || sigs.length === 0) return [];
+  const mints = new Set();
+  for (const s of sigs.slice(0, txLimit || 25)) {
+    const tx = await getParsedTransaction(s.signature);
+    if (!tx) { await new Promise(r => setTimeout(r, 250)); continue; }
+    const post = tx.meta?.postTokenBalances || [];
+    const pre  = tx.meta?.preTokenBalances || [];
+    for (const pb of post) {
+      const preMatch = pre.find(p => p.accountIndex === pb.accountIndex);
+      const preAmt = preMatch ? Number(preMatch.uiTokenAmount?.uiAmount || 0) : 0;
+      const postAmt = Number(pb.uiTokenAmount?.uiAmount || 0);
+      if (postAmt > preAmt && pb.owner === address && pb.mint !== 'So11111111111111111111111111111111111111112') {
+        mints.add(pb.mint);
+      }
+    }
+    await new Promise(r => setTimeout(r, 300)); // safe pacing for free public RPC
+  }
+  return [...mints];
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ROAD MAP 2 — DEX ANALYSIS ENGINE
+// ═══════════════════════════════════════════════════════════
+
+// ── 1. VOLUME MOMENTUM SCORING ──────────────────────────────
 function scoreVolumeMomentum(p) {
   let score = 0;
   const notes = [];
+
+  const v5m  = parseFloat(p.volume?.m5  || 0);
   const v1h  = parseFloat(p.volume?.h1  || 0);
   const v6h  = parseFloat(p.volume?.h6  || 0);
-  const ch5m = parseFloat(p.priceChange?.m5  || 0);
-  const ch1h = parseFloat(p.priceChange?.h1  || 0);
-  const buys1h  = p.txns?.h1?.buys  || 0;
-  const sells1h = p.txns?.h1?.sells || 0;
-  const buys24  = p.txns?.h24?.buys  || 0;
+  const v24h = parseFloat(p.volume?.h24 || 0);
+
+  const ch5m  = parseFloat(p.priceChange?.m5  || 0);
+  const ch1h  = parseFloat(p.priceChange?.h1  || 0);
+  const ch6h  = parseFloat(p.priceChange?.h6  || 0);
+  const ch24h = parseFloat(p.priceChange?.h24 || 0);
+
+  const buys   = p.txns?.h1?.buys   || 0;
+  const sells  = p.txns?.h1?.sells  || 0;
+  const buys24 = p.txns?.h24?.buys  || 0;
   const sells24 = p.txns?.h24?.sells || 0;
 
   if (v6h > 0) {
-    const share = (v1h / v6h) * 100;
-    if (share > 50)      { score += 25; notes.push('🔥 Huge volume spike 1h (' + share.toFixed(0) + '%)'); }
-    else if (share > 30) { score += 15; notes.push('📈 Strong volume 1h (' + share.toFixed(0) + '%)'); }
-    else if (share > 15) { score += 7;  notes.push('📊 Moderate volume'); }
-    else                  { score -= 3;  notes.push('⚠️ Volume slowing'); }
+    const v1hShare = (v1h / v6h) * 100;
+    if (v1hShare > 40)      { score += 20; notes.push('🔥 Volume spike last 1h (' + v1hShare.toFixed(0) + '% of 6h vol)'); }
+    else if (v1hShare > 25) { score += 12; notes.push('📈 Rising volume (' + v1hShare.toFixed(0) + '% of 6h vol)'); }
+    else if (v1hShare > 15) { score += 6;  notes.push('📊 Moderate volume'); }
   }
-  if (buys1h + sells1h > 0) {
-    const bp = (buys1h / (buys1h + sells1h)) * 100;
-    if (bp > 70)      { score += 20; notes.push('🟢 Strong buys ' + bp.toFixed(0) + '%'); }
-    else if (bp > 55) { score += 10; notes.push('🟡 Good buys ' + bp.toFixed(0) + '%'); }
-    else if (bp < 40) { score -= 15; notes.push('🔴 Selling pressure ' + (100-bp).toFixed(0) + '%'); }
+
+  if (v1h > 0 && v5m > 0) {
+    const v5mRate = v5m / (v1h / 12);
+    if (v5mRate > 3)        { score += 15; notes.push('⚡ 5m volume 3x above average'); }
+    else if (v5mRate > 1.5) { score += 8;  notes.push('📈 5m volume above average'); }
   }
+
+  if (buys + sells > 0) {
+    const buyPct = (buys / (buys + sells)) * 100;
+    if (buyPct > 70)      { score += 15; notes.push('🟢 Strong buy pressure (' + buyPct.toFixed(0) + '% buys 1h)'); }
+    else if (buyPct > 55) { score += 8;  notes.push('🟡 Moderate buy pressure (' + buyPct.toFixed(0) + '% buys 1h)'); }
+    else if (buyPct < 40) { score -= 10; notes.push('🔴 Sell pressure dominant (' + buyPct.toFixed(0) + '% buys 1h)'); }
+  }
+
   if (buys24 + sells24 > 0) {
-    const bp24 = (buys24 / (buys24 + sells24)) * 100;
-    if (bp24 > 60) { score += 10; notes.push('✅ Healthy 24h ratio ' + bp24.toFixed(0) + '%'); }
-    else if (bp24 < 40) { score -= 8; notes.push('⚠️ More sells 24h'); }
+    const buyPct24 = (buys24 / (buys24 + sells24)) * 100;
+    if (buyPct24 > 65)      { score += 10; notes.push('✅ Healthy buy/sell ratio 24h'); }
+    else if (buyPct24 < 35) { score -= 8;  notes.push('⚠️ More sells than buys 24h'); }
   }
-  if (ch5m > 5 && ch1h > 10)   { score += 15; notes.push('🚀 Strong momentum'); }
-  else if (ch5m > 2 && ch1h > 3){ score += 8;  notes.push('📈 Good momentum'); }
-  if (ch5m < -10 && ch1h < -10) { score -= 20; notes.push('📉 Dumping'); }
+
+  if (ch5m > 5 && ch1h > 10)    { score += 10; notes.push('🚀 Price momentum strong (5m + 1h both up)'); }
+  if (ch5m < -5 && ch1h < -5)   { score -= 15; notes.push('📉 Negative momentum (dumping)'); }
+  if (ch24h > 50 && ch1h < -10) { score -= 10; notes.push('⚠️ Possible dead cat bounce'); }
 
   return { score: Math.max(0, Math.min(score, 100)), notes };
 }
 
+// ── 2. WHALE DETECTION ──────────────────────────────────────
 function scoreWhaleDetection(p, rug) {
   let score = 0;
   const notes = [];
   const whales = [];
-  if (!rug) return { score: 10, notes: ['⚪ No rug data'], whales };
 
-  const holders = rug?.topHolders || rug?.holders || [];
-  if (holders.length > 0) {
-    const list = holders.map(h => ({ addr: h.address||'', pct: Number(h.pct||h.percentage||h.share||0) }))
-      .filter(h => h.addr && h.pct > 0 && h.pct < 60).sort((a,b) => b.pct - a.pct);
-    const top1  = list[0]?.pct || 0;
-    const top10 = list.slice(0,10).reduce((a,b) => a+b.pct, 0);
-    if (top1 > 15)     { score -= 25; notes.push('🐋 DANGER top holder ' + top1.toFixed(1) + '%'); }
-    else if (top1 > 8) { score -= 10; notes.push('⚠️ Top holder ' + top1.toFixed(1) + '%'); }
-    else               { score += 15; notes.push('✅ Top holder only ' + top1.toFixed(1) + '%'); }
-    if (top10 < 20)     { score += 20; notes.push('✅ Great distribution top10=' + top10.toFixed(1) + '%'); }
-    else if (top10 < 35){ score += 8;  notes.push('🟡 OK distribution top10=' + top10.toFixed(1) + '%'); }
-    else                { score -= 10; notes.push('🔴 Concentrated top10=' + top10.toFixed(1) + '%'); }
-    list.slice(0,3).forEach((h,i) => { if(h.pct>1) whales.push({rank:i+1, addr:h.addr.slice(0,6)+'...'+h.addr.slice(-4), pct:h.pct.toFixed(2)}); });
-  } else { score += 5; notes.push('⚪ No holder data'); }
+  if (!rug) return { score: 0, notes: ['⚪ No rug data for whale analysis'], whales };
+
+  const liq = p.liquidity?.usd || 0;
+  const mc  = p.fdv || 0;
+
+  const holdersData = rug?.topHolders || rug?.holders || [];
+  if (Array.isArray(holdersData) && holdersData.length > 0) {
+    const filtered = holdersData
+      .map(h => ({ address: h.address || '', pct: Number(h.pct || h.percentage || h.share || 0) }))
+      .filter(h => h.address && h.pct > 0 && h.pct < 50)
+      .sort((a, b) => b.pct - a.pct);
+
+    const top1pct  = filtered[0]?.pct || 0;
+    const top10pct = filtered.slice(0, 10).reduce((a, b) => a + b.pct, 0);
+
+    if (top1pct > 10)      { score -= 20; notes.push('🐋 DANGER: Top holder owns ' + top1pct.toFixed(1) + '% — dump risk'); }
+    else if (top1pct > 5)  { score -= 8;  notes.push('⚠️ Top holder owns ' + top1pct.toFixed(1) + '%'); }
+    else if (top1pct < 3)  { score += 10; notes.push('✅ Top holder only ' + top1pct.toFixed(1) + '% — distributed'); }
+
+    if (top10pct < 15)      { score += 15; notes.push('✅ Excellent distribution — top 10 hold ' + top10pct.toFixed(1) + '%'); }
+    else if (top10pct < 20) { score += 8;  notes.push('🟡 Good distribution — top 10 hold ' + top10pct.toFixed(1) + '%'); }
+    else if (top10pct > 30) { score -= 10; notes.push('🔴 Concentrated — top 10 hold ' + top10pct.toFixed(1) + '%'); }
+
+    filtered.slice(0, 5).forEach((h, i) => {
+      if (h.pct > 1) whales.push({ rank: i + 1, address: h.address.slice(0, 6) + '...' + h.address.slice(-4), pct: h.pct.toFixed(2) });
+    });
+  }
 
   if (rug.insiderNetworks?.length > 0) {
-    const bPct = rug.insiderNetworks.reduce((a,b) => a+(b.holdingPercent||0), 0);
-    if (bPct > 20)     { score -= 25; notes.push('🔴 Bundles ' + bPct.toFixed(1) + '%'); }
-    else if (bPct > 10){ score -= 8;  notes.push('⚠️ Some bundles ' + bPct.toFixed(1) + '%'); }
-    else               { score += 10; notes.push('✅ No significant bundles'); }
-  } else { score += 10; notes.push('✅ No bundles'); }
+    const boughtPct = rug.insiderNetworks.reduce((a, b) => a + (b.holdingPercent || 0), 0);
+    const nowPct    = rug.insiderNetworks.reduce((a, b) => a + (b.currentHoldingPercent || 0), 0);
+    if (boughtPct > 30)      { score -= 25; notes.push('🔴 DANGER: Bundles bought ' + boughtPct.toFixed(1) + '%, still hold ' + nowPct.toFixed(1) + '%'); }
+    else if (boughtPct > 15) { score -= 12; notes.push('⚠️ Bundles: ' + boughtPct.toFixed(1) + '% bought, ' + nowPct.toFixed(1) + '% remaining'); }
+    else                      { score += 5;  notes.push('✅ Low bundle activity (' + boughtPct.toFixed(1) + '%)'); }
+  } else {
+    score += 10;
+    notes.push('✅ No bundles detected');
+  }
 
   if (rug.snipers?.length > 0) {
-    const sPct = rug.snipers.reduce((a,b) => a+(b.holdingPercent||0), 0);
-    if (sPct > 10) { score -= 10; notes.push('🎯 Snipers ' + sPct.toFixed(1) + '%'); }
-    else           { score += 5;  notes.push('✅ Low snipers'); }
-  } else { score += 5; notes.push('✅ No snipers'); }
+    const sniperPct = rug.snipers.reduce((a, b) => a + (b.holdingPercent || 0), 0);
+    const nowPct    = rug.snipers.reduce((a, b) => a + (b.currentHoldingPercent || 0), 0);
+    if (sniperPct > 10) { score -= 15; notes.push('🎯 Snipers: ' + rug.snipers.length + ' wallets, ' + sniperPct.toFixed(1) + '% bought, ' + nowPct.toFixed(1) + '% holding'); }
+    else                { score += 5;  notes.push('✅ Low sniper activity (' + rug.snipers.length + ' wallets)'); }
+  } else {
+    score += 5;
+    notes.push('✅ No snipers detected');
+  }
+
+  if (mc > 0 && liq > 0) {
+    const liqRatio = (liq / mc) * 100;
+    if (liqRatio > 15)     { score += 10; notes.push('✅ Strong liquidity ratio (' + liqRatio.toFixed(1) + '% of MC)'); }
+    else if (liqRatio > 8) { score += 5;  notes.push('🟡 Moderate liquidity (' + liqRatio.toFixed(1) + '% of MC)'); }
+    else                   { score -= 5;  notes.push('⚠️ Low liquidity ratio (' + liqRatio.toFixed(1) + '% of MC)'); }
+  }
 
   return { score: Math.max(0, Math.min(score, 100)), notes, whales };
 }
 
+// ── 3. SMART MONEY TRACKING ─────────────────────────────────
 function scoreSmartMoney(p, rug) {
   let score = 0;
   const notes = [];
-  if (!rug) return { score: 10, notes: ['⚪ No rug data'] };
+
+  if (!rug) return { score: 0, notes: ['⚪ No data for smart money analysis'] };
+
   const v1h  = p.volume?.h1 || 0;
   const buys = p.txns?.h1?.buys || 0;
+
   if (buys > 0 && v1h > 0) {
-    const avg = v1h / buys;
-    if (avg > 1000)     { score += 25; notes.push('💰 Large avg buy $' + avg.toFixed(0)); }
-    else if (avg > 500) { score += 15; notes.push('💵 Good avg buy $' + avg.toFixed(0)); }
-    else if (avg > 200) { score += 7;  notes.push('🟡 Small avg buy $' + avg.toFixed(0)); }
-    else                { score += 2;  notes.push('⚠️ Very small avg buy $' + avg.toFixed(0)); }
+    const avgBuySize = v1h / buys;
+    if (avgBuySize > 1000)     { score += 20; notes.push('💰 Avg buy size $' + avgBuySize.toFixed(0) + ' — large wallets buying'); }
+    else if (avgBuySize > 500) { score += 12; notes.push('💵 Avg buy size $' + avgBuySize.toFixed(0) + ' — decent wallet sizes'); }
+    else if (avgBuySize > 200) { score += 6;  notes.push('🟡 Avg buy size $' + avgBuySize.toFixed(0) + ' — small/retail buys'); }
+    else                        { notes.push('⚠️ Very small avg buy $' + avgBuySize.toFixed(0) + ' — mostly bots/small wallets'); }
   }
+
   if (rug.creator) {
-    const devH = (rug?.topHolders||[]).find(h => h.address === rug.creator);
-    const devPct = devH ? Number(devH.pct||0) : 0;
-    if (devPct === 0)    { score += 20; notes.push('✅ Dev not holding'); }
-    else if (devPct < 3) { score += 10; notes.push('✅ Dev minimal ' + devPct.toFixed(1) + '%'); }
-    else if (devPct > 5) { score -= 20; notes.push('🔴 Dev holds ' + devPct.toFixed(1) + '%!'); }
-    else                  { score += 3;  notes.push('🟡 Dev ' + devPct.toFixed(1) + '%'); }
+    const devHolder = (rug?.topHolders || []).find(h => h.address === rug.creator);
+    const devPct = devHolder ? Number(devHolder.pct || 0) : 0;
+    const devBal = rug.creatorBalance ? rug.creatorBalance / 1e9 : 0;
+
+    if (devPct === 0)     { score += 15; notes.push('✅ Dev sold/burned tokens — not holding'); }
+    else if (devPct < 2)  { score += 8;  notes.push('✅ Dev holds only ' + devPct.toFixed(1) + '% — low risk'); }
+    else if (devPct > 5)  { score -= 15; notes.push('🔴 Dev holds ' + devPct.toFixed(1) + '% — dump risk!'); }
+    else                   { score += 2;  notes.push('🟡 Dev holds ' + devPct.toFixed(1) + '%'); }
+
+    if (devBal < 1)       { score += 5;  notes.push('✅ Dev wallet low SOL balance'); }
+    else if (devBal > 10) { score -= 5;  notes.push('⚠️ Dev wallet has ' + devBal.toFixed(1) + ' SOL'); }
   }
+
   if (rug.score !== undefined) {
     const rs = Number(rug.score);
     if (rs < 200)      { score += 20; notes.push('🟢 Very safe rug score: ' + rs); }
-    else if (rs < 500) { score += 10; notes.push('🟡 OK rug score: ' + rs); }
-    else               { score -= 10; notes.push('🔴 High rug score: ' + rs); }
+    else if (rs < 400) { score += 12; notes.push('🟡 Acceptable rug score: ' + rs); }
+    else if (rs < 600) { score += 4;  notes.push('🟠 Moderate rug score: ' + rs); }
+    else               { score -= 15; notes.push('🔴 High rug score: ' + rs + ' — risky!'); }
   }
-  const hasSocials = p.info?.socials?.length > 0 || p.info?.websites?.length > 0;
-  if (hasSocials) { score += 8; notes.push('✅ Has socials'); }
+
+  const hasSocials = (p.info?.socials?.length > 0) || (p.info?.websites?.length > 0);
+  if (hasSocials) { score += 8; notes.push('✅ Has social links / website'); }
+  else            { score -= 5; notes.push('⚠️ No socials — anonymous project'); }
+
+  if (p.boosts?.active > 0 || p.profile || p.info?.header) {
+    score += 7;
+    notes.push('✅ Dex paid — team spending on marketing');
+  }
+
   if (rug.markets?.length > 0) {
     const locked = rug.markets.some(m => m.lp?.lpLockedPct > 50);
-    if (locked) { score += 15; notes.push('🔒 LP locked!'); }
+    if (locked) { score += 15; notes.push('🔒 Liquidity locked — strong signal'); }
+    else        { score -= 5;  notes.push('⚠️ Liquidity not locked'); }
   }
+
   return { score: Math.max(0, Math.min(score, 100)), notes };
 }
 
+// ── 4. MASTER SCORE ─────────────────────────────────────────
 function calcTokenStrength(p, rug) {
-  const mom = scoreVolumeMomentum(p);
-  const whl = scoreWhaleDetection(p, rug);
-  const smt = scoreSmartMoney(p, rug);
-  const final = Math.round((mom.score * 0.35) + (whl.score * 0.35) + (smt.score * 0.30));
-  let grade, emoji;
-  if (final >= 80)      { grade = 'S'; emoji = '🏆'; }
-  else if (final >= 65) { grade = 'A'; emoji = '🔥'; }
-  else if (final >= 50) { grade = 'B'; emoji = '✅'; }
-  else if (final >= 35) { grade = 'C'; emoji = '🟡'; }
-  else                   { grade = 'D'; emoji = '🔴'; }
-  return { final, grade, emoji, passes: final >= SCORE_PASS_MIN, mom, whl, smt };
+  const momentum = scoreVolumeMomentum(p);
+  const whale    = scoreWhaleDetection(p, rug);
+  const smart    = scoreSmartMoney(p, rug);
+
+  const finalScore = Math.round(
+    (momentum.score * 0.35) +
+    (whale.score    * 0.35) +
+    (smart.score    * 0.30)
+  );
+
+  let grade, gradeEmoji;
+  if (finalScore >= 80)      { grade = 'S'; gradeEmoji = '🏆'; }
+  else if (finalScore >= 65) { grade = 'A'; gradeEmoji = '🔥'; }
+  else if (finalScore >= 50) { grade = 'B'; gradeEmoji = '✅'; }
+  else if (finalScore >= 35) { grade = 'C'; gradeEmoji = '🟡'; }
+  else                        { grade = 'D'; gradeEmoji = '🔴'; }
+
+  return { finalScore, grade, gradeEmoji, passes: finalScore >= SCORE_PASS_MIN, momentum, whale, smart };
 }
 
-function fmtAnalysis(a, isPublic) {
-  let r = '\n━━━━━━━━━━━━━━━━━━━\n🧠 *DEX ANALYSIS*\n━━━━━━━━━━━━━━━━━━━\n\n';
-  r += a.emoji + ' *Score: ' + a.final + '/100 — Grade ' + a.grade + '*\n\n';
-  r += '📊 *Momentum* (' + a.mom.score + 'pts)\n';
-  a.mom.notes.slice(0,3).forEach(n => { r += '  ' + n + '\n'; });
-  r += '\n🐋 *Whales* (' + a.whl.score + 'pts)\n';
-  a.whl.notes.slice(0,3).forEach(n => { r += '  ' + n + '\n'; });
-  if (a.whl.whales?.length > 0) a.whl.whales.forEach(w => { r += '  #' + w.rank + ' ' + w.addr + ' — ' + w.pct + '%\n'; });
-  r += '\n💰 *Smart Money* (' + a.smt.score + 'pts)\n';
-  a.smt.notes.slice(0,3).forEach(n => { r += '  ' + n + '\n'; });
-  r += '\n━━━━━━━━━━━━━━━━━━━\n';
-  if (isPublic) {
-    if (a.final >= 65) r += '🟢 *Verdict: Strong signals — looks healthy*\n';
-    else if (a.final >= 40) r += '🟡 *Verdict: Mixed signals — DYOR carefully*\n';
-    else r += '🔴 *Verdict: Weak signals — high risk*\n';
-  } else {
-    r += a.passes ? '✅ *PASSES — Ready for review*\n' : '❌ *FAILS — Score ' + a.final + '/' + SCORE_PASS_MIN + '*\n';
+// ── 5. FORMAT ANALYSIS REPORT ───────────────────────────────
+function formatAnalysisReport(analysis) {
+  const { finalScore, grade, gradeEmoji, momentum, whale, smart } = analysis;
+  let report = '\n━━━━━━━━━━━━━━━━━━━\n';
+  report += '🧠 *DEX ANALYSIS ENGINE*\n';
+  report += '━━━━━━━━━━━━━━━━━━━\n\n';
+  report += gradeEmoji + ' *Strength Score: ' + finalScore + '/100 — Grade ' + grade + '*\n\n';
+
+  report += '📊 *Volume Momentum* (' + momentum.score + ' pts)\n';
+  momentum.notes.slice(0, 3).forEach(n => { report += '  ' + n + '\n'; });
+
+  report += '\n🐋 *Whale Analysis* (' + whale.score + ' pts)\n';
+  whale.notes.slice(0, 3).forEach(n => { report += '  ' + n + '\n'; });
+  if (whale.whales?.length > 0) {
+    report += '  Top holders:\n';
+    whale.whales.slice(0, 3).forEach(w => { report += '  #' + w.rank + ' ' + w.address + ' — ' + w.pct + '%\n'; });
   }
-  return r;
+
+  report += '\n💰 *Smart Money* (' + smart.score + ' pts)\n';
+  smart.notes.slice(0, 3).forEach(n => { report += '  ' + n + '\n'; });
+
+  report += '\n━━━━━━━━━━━━━━━━━━━\n';
+  report += analysis.passes
+    ? '✅ *PASSES — signal approved for review*\n'
+    : '❌ *FAILS — score too low (' + finalScore + '/' + SCORE_PASS_MIN + ' needed)*\n';
+
+  return report;
 }
 
-// ═══════════════════════════════════════════════
-//  ANALYZE TOKEN FOR SIGNAL
-// ═══════════════════════════════════════════════
+// ── NEW: AI EXPLANATION LAYER ────────────────────────────────
+async function getAIExplanation(p, analysis) {
+  if (!ANTHROPIC_API_KEY) return null;
+  try {
+    const prompt = 'Token: ' + p.baseToken.name + ' (' + p.baseToken.symbol + '). DEX strength score: ' +
+      analysis.finalScore + '/100, grade ' + analysis.grade + '. MC: $' + Math.round(p.fdv || 0) +
+      ', Liquidity: $' + Math.round(p.liquidity?.usd || 0) + ', 24h change: ' + (p.priceChange?.h24 || 0) +
+      '%. Ka rubuta jimla 1-2 a Hausa, sauƙi, kai-tsaye, ka bayyana ko wannan token yana da kyau ko haɗari a yanzu kuma me yasa. Kada ka rubuta gargaɗin "ba shawarar kuɗi ba" — kai tsaye ka tafi kan bayani.';
+    const res = await axios.post('https://api.anthropic.com/v1/messages', {
+      model: AI_MODEL,
+      max_tokens: 150,
+      messages: [{ role: 'user', content: prompt }]
+    }, {
+      headers: { 'x-api-key': ANTHROPIC_API_KEY, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      timeout: 15000
+    });
+    const text = res.data?.content?.find(c => c.type === 'text')?.text;
+    return text ? text.trim() : null;
+  } catch(e) { console.error('AI explanation error:', e.message); return null; }
+}
+
+// ── NEW: WALLET VERIFICATION ENGINE ──────────────────────────
+async function verifyWallet(address) {
+  try {
+    const mints = await getWalletRecentTokenBuys(address, 20);
+    if (mints.length < MIN_TOKENS_FOR_VERIFICATION) {
+      return { verified: false, reason: 'Tarihin ciniki ƴan kaɗan ne (' + mints.length + ' tokens)' };
+    }
+    let upCount = 0, checked = 0;
+    for (const mint of mints.slice(0, 15)) {
+      const p = await getTokenData(mint);
+      if (!p) continue;
+      checked++;
+      const ch24 = parseFloat(p.priceChange?.h24 || 0);
+      const ch6h = parseFloat(p.priceChange?.h6 || 0);
+      if (ch24 > 20 || ch6h > 15) upCount++;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    if (checked === 0) return { verified: false, reason: 'Ba a samu bayanan tokens domin verification ba' };
+    const winRate = (upCount / checked) * 100;
+    const successScore = Math.round(winRate);
+    const verified = winRate >= MIN_WIN_RATE_FOR_VERIFICATION;
+    return {
+      verified, winRate, successScore, totalTrades: checked,
+      reason: verified ? 'Ya tabbata (verified)' : ('Win rate ƴan kaɗan ne: ' + winRate.toFixed(0) + '%')
+    };
+  } catch(e) {
+    return { verified: false, reason: 'Verification error: ' + e.message };
+  }
+}
+
+async function processWalletSubmissions() {
+  const pending = getPendingSubmissions(5);
+  for (const sub of pending) {
+    const result = await verifyWallet(sub.wallet_address);
+    if (result.verified) {
+      addVerifiedWallet(sub.wallet_address, sub.source, sub.submitted_by, result.winRate, result.successScore, result.totalTrades);
+      markSubmission(sub.id, 'verified');
+      if (sub.source === 'crowdsourced' && sub.submitted_by && sub.submitted_by !== 'unknown') {
+        const expiry = grantPremium(sub.submitted_by, PREMIUM_REWARD_DAYS);
+        try {
+          await bot.sendMessage(sub.submitted_by,
+            '🎉 Wallet ɗinka da ka turo (`' + sub.wallet_address.slice(0, 6) + '...' + sub.wallet_address.slice(-4) + '`) ya tabbata (verified)!\n\n' +
+            '🎁 Mun baka kwana ' + PREMIUM_REWARD_DAYS + ' na VIP Premium kyauta. Na gode!',
+            { parse_mode: 'Markdown' });
+        } catch(e) {}
+      }
+      try {
+        await bot.sendMessage(ADMIN_ID,
+          '✅ *Wallet Verified*\n`' + sub.wallet_address + '`\nWin rate: ' + result.winRate.toFixed(0) + '% (' + result.totalTrades + ' trades)\nSource: ' + sub.source,
+          { parse_mode: 'Markdown' });
+      } catch(e) {}
+    } else {
+      markSubmission(sub.id, 'rejected');
+      console.log('[Wallet] Rejected: ' + sub.wallet_address.slice(0, 8) + '... — ' + result.reason);
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+}
+
+// ── NEW: SMART WALLET MONITORING ─────────────────────────────
+const lastSeenWalletTx = {};
+
+async function monitorSmartWallets() {
+  const verified = getVerifiedWallets().map(w => w.address);
+  const all = [...new Set([...CURATED_WALLETS, ...verified])];
+  if (all.length === 0) return;
+  for (const address of all) {
+    try {
+      const sigs = await getWalletRecentSignatures(address, 5);
+      if (!sigs || sigs.length === 0) continue;
+      const newest = sigs[0].signature;
+      if (lastSeenWalletTx[address] === newest) continue;
+      const isFirstRun = !lastSeenWalletTx[address];
+      lastSeenWalletTx[address] = newest;
+      if (isFirstRun) continue; // establish baseline only, don't alert on first check
+
+      const tx = await getParsedTransaction(newest);
+      if (!tx) continue;
+      const post = tx.meta?.postTokenBalances || [];
+      const pre  = tx.meta?.preTokenBalances || [];
+      for (const pb of post) {
+        const preMatch = pre.find(p => p.accountIndex === pb.accountIndex);
+        const preAmt = preMatch ? Number(preMatch.uiTokenAmount?.uiAmount || 0) : 0;
+        const postAmt = Number(pb.uiTokenAmount?.uiAmount || 0);
+        if (postAmt > preAmt && pb.owner === address && pb.mint !== 'So11111111111111111111111111111111111111112') {
+          await handleSmartWalletBuy(address, pb.mint);
+        }
+      }
+      await new Promise(r => setTimeout(r, 800));
+    } catch(e) { console.error('monitorSmartWallets error:', e.message); }
+  }
+}
+
+async function handleSmartWalletBuy(walletAddress, ca) {
+  try {
+    const p = await getTokenData(ca);
+    if (!p || p.chainId !== 'solana') return;
+    const rug = await getRugcheck(ca);
+    const analysis = calcTokenStrength(p, rug);
+    const alphaScore = Math.max(0, Math.min(100, Math.round((analysis.finalScore * 0.7) + 30)));
+    logAlphaSignal(ca, walletAddress, alphaScore);
+    const shortWallet = walletAddress.slice(0, 4) + '...' + walletAddress.slice(-4);
+    const explanation = await getAIExplanation(p, analysis);
+    await bot.sendMessage(ADMIN_ID,
+      '🐳 *SMART WALLET ALERT*\n' +
+      'Wallet `' + shortWallet + '` just bought:\n\n' +
+      '🪙 *' + p.baseToken.name + '* (' + p.baseToken.symbol + ')\n' +
+      '💊 MC: ' + fmt(p.fdv) + ' | 💧 Liq: ' + fmt(p.liquidity?.usd) + '\n' +
+      analysis.gradeEmoji + ' DEX Score: ' + analysis.finalScore + '/100\n' +
+      '⭐ Alpha Score: ' + alphaScore + '/100\n\n' +
+      (explanation ? '🤖 *AI Take:* ' + explanation + '\n\n' : '') +
+      '📋 `' + ca + '`',
+      { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: '👁️ Review as Signal', callback_data: 'signal_' + ca }]] } }
+    );
+  } catch(e) { console.error('handleSmartWalletBuy error:', e.message); }
+}
+
+// ── NEW: TELEGRAM ALPHA-GROUP LISTENER (GramJS) ──────────────
+let gramClient = null;
+
+async function initGramListener() {
+  if (!GRAMJS_AVAILABLE) return;
+  if (!TG_API_ID || !TG_API_HASH || !TG_SESSION) {
+    console.log('[GramJS] TG_API_ID/TG_API_HASH/TG_SESSION ba a saita su a .env ba — listener OFF. Duba .env.example.');
+    return;
+  }
+  try {
+    gramClient = new TelegramClient(new StringSession(TG_SESSION), TG_API_ID, TG_API_HASH, { connectionRetries: 5 });
+    await gramClient.connect();
+    gramClient.addEventHandler(handleAlphaGroupMessage, new NewMessage({}));
+    console.log('[GramJS] Connected. Watching groups: ' + (ALPHA_GROUPS.length ? ALPHA_GROUPS.join(', ') : '(duba console domin gano chat IDs)'));
+  } catch(e) {
+    console.error('[GramJS] init error:', e.message);
+  }
+}
+
+async function handleAlphaGroupMessage(event) {
+  try {
+    const message = event.message;
+    if (!message || !message.message) return;
+    const chatId = event.chatId ? event.chatId.toString() : '';
+
+    if (ALPHA_GROUPS.length === 0) {
+      // Onboarding aid: log chat IDs seen so you can fill ALPHA_GROUPS in .env
+      console.log('[GramJS discover] chatId=' + chatId + ' text="' + message.message.slice(0, 40) + '"');
+    }
+    if (ALPHA_GROUPS.length > 0 && !ALPHA_GROUPS.includes(chatId)) return;
+
+    const matches = message.message.match(SOLANA_ADDRESS_REGEX);
+    if (!matches) return;
+    for (const addr of matches) {
+      addWalletSubmission(addr, 'telegram_listener', chatId || 'unknown_group');
+    }
+  } catch(e) { console.error('Alpha group message error:', e.message); }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  SCAN & ANALYSIS
+// ═══════════════════════════════════════════════════════════
 async function analyzeForSignal(ca) {
   try {
     const p = await getTokenData(ca);
-    if (!p) return null;
-
+    if (!p || p.chainId !== 'solana') return null;
     if (!p.pairCreatedAt) return null;
-    const ageH = (Date.now() - p.pairCreatedAt) / 3600000;
-    const mc  = p.fdv || 0;
+
+    const ageHours = (Date.now() - p.pairCreatedAt) / (1000 * 60 * 60);
+    if (ageHours < MIN_AGE_HOURS || ageHours > MAX_AGE_HOURS) return null;
+
     const liq = p.liquidity?.usd || 0;
-
-    // Filters
-    if (ageH < MIN_AGE_HOURS || ageH > MAX_AGE_HOURS) return null;
-    if (mc < MIN_MC || mc > MAX_MC) return null;
     if (liq < MIN_LIQUIDITY) return null;
-    if ((p.volume?.h24 || 0) < MIN_VOLUME_24H) return null;
 
-    // Not crashing
-    const ch1h = parseFloat(p.priceChange?.h1 || 0);
-    if (ch1h < -40) return null;
+    const mc = p.fdv || 0;
+    if (mc < 30000 || mc > 100000) return null;
 
-    // Rug check
+    const ch24  = parseFloat(p.priceChange?.h24 || 0);
+    const ch5m  = parseFloat(p.priceChange?.m5  || 0);
+    const ch15m = parseFloat(p.priceChange?.m15 || 0);
+    if (ch24 < 5) return null;
+    if (ch5m <= -10 && ch15m <= -10) return null;
+    if ((p.volume?.h24 || 0) < 500) return null;
+
     const rug = await getRugcheck(ca);
-    if (rug?.score && rug.score > MAX_RUG_SCORE) return null;
+    if (rug && rug.score && rug.score > MAX_RUG_SCORE) return null;
 
     if (rug) {
-      const holders = rug?.topHolders || rug?.holders || [];
-      if (holders.length > 0) {
-        const list = holders.map(h => Number(h.pct||h.percentage||h.share||0)).filter(x => x>0&&x<60);
-        const top10 = list.sort((a,b)=>b-a).slice(0,10).reduce((a,b)=>a+b,0);
-        if (top10 > 50) return null;
+      const holdersData = rug?.topHolders || rug?.holders || [];
+      if (Array.isArray(holdersData) && holdersData.length > 0) {
+        const list = holdersData.map(h => Number(h.pct || h.percentage || h.share || 0)).filter(p => p > 0 && p < 50).sort((a, b) => b - a);
+        if (list.length > 0) {
+          const top10pct = list.slice(0, 10).reduce((a, b) => a + b, 0);
+          if (top10pct > 20) return null;
+        }
       }
-      if (rug.insiderNetworks?.length > 20) return null;
+      if (rug.insiderNetworks && rug.insiderNetworks.length > 10) return null;
+      if (rug.snipers && rug.snipers.length > 10) return null;
     }
 
     const analysis = calcTokenStrength(p, rug);
     if (!analysis.passes) {
-      console.log('FAIL', ca.slice(0,8), 'score:', analysis.final, 'age:', ageH.toFixed(1)+'h', 'mc:', fmt(mc));
+      console.log('FAIL ' + ca.slice(0, 8) + '... score: ' + analysis.finalScore + '/' + SCORE_PASS_MIN);
       return null;
     }
 
-    console.log('✅ PASS', ca.slice(0,8), 'score:', analysis.final, 'grade:', analysis.grade, 'age:', ageH.toFixed(1)+'h', 'mc:', fmt(mc));
+    console.log('PASS ' + ca.slice(0, 8) + '... score: ' + analysis.finalScore + '/100 Grade ' + analysis.grade);
     return { p, rug, analysis };
+
   } catch(e) { return null; }
 }
 
-// ═══════════════════════════════════════════════
-//  SCAN
-// ═══════════════════════════════════════════════
-async function runScan(manual) {
+async function runScan(triggeredBy) {
   if (isScanning) {
-    if (manual) bot.sendMessage(ADMIN_ID, '⏳ Scan already running...');
+    if (triggeredBy) bot.sendMessage(ADMIN_ID, 'Scan is already running! Please wait...');
     return;
   }
-  if (getTodaySignalCount() >= MAX_SIGNALS_PER_DAY) {
-    if (manual) bot.sendMessage(ADMIN_ID, '✅ Max signals today (' + MAX_SIGNALS_PER_DAY + '/' + MAX_SIGNALS_PER_DAY + ')');
+  const todayCount = getTodaySignalCount();
+  if (todayCount >= MAX_SIGNALS_PER_DAY) {
+    if (triggeredBy) bot.sendMessage(ADMIN_ID, 'Max signals reached today (' + MAX_SIGNALS_PER_DAY + '/' + MAX_SIGNALS_PER_DAY + '). Try tomorrow!');
     return;
   }
   isScanning = true;
-  if (manual) bot.sendMessage(ADMIN_ID, '🔍 Scanning...\n⏰ Age: ' + MIN_AGE_HOURS + '-' + MAX_AGE_HOURS + 'h | MC: ' + fmt(MIN_MC) + '-' + fmt(MAX_MC));
-  console.log('=== SCAN START ===');
-
+  console.log('Scanning... (' + todayCount + '/' + MAX_SIGNALS_PER_DAY + ')');
   try {
-    const cas = await fetchCandidateTokens();
-    if (manual) bot.sendMessage(ADMIN_ID, '📋 ' + cas.length + ' candidates — analyzing...');
-
-    let found = 0, checked = 0;
-    for (const ca of cas) {
+    const allCAs = await fetchCandidateTokens();
+    let found = 0;
+    for (const ca of allCAs) {
       if (getTodaySignalCount() >= MAX_SIGNALS_PER_DAY) break;
       if (alreadyScanned(ca)) continue;
       markScanned(ca);
-      checked++;
       const result = await analyzeForSignal(ca);
       if (result) {
         found++;
-        await sendSignalForReview(ca, result.p, result.rug, result.analysis, true);
-        await new Promise(r => setTimeout(r, 3000));
+        await sendSignalForReview(ca, result.p, result.rug, true, result.analysis);
+        await new Promise(r => setTimeout(r, 5000));
       }
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 1000));
     }
-
-    console.log('=== SCAN DONE === checked:', checked, 'found:', found);
-    if (manual) {
-      bot.sendMessage(ADMIN_ID, found === 0
-        ? '🔍 Done — checked ' + checked + ' tokens, none passed.\n\nFilters: Age ' + MIN_AGE_HOURS + '-' + MAX_AGE_HOURS + 'h | MC ' + fmt(MIN_MC) + '-' + fmt(MAX_MC) + ' | Score ' + SCORE_PASS_MIN + '+\n\nNext scan in 15 mins.'
-        : '✅ Done — ' + found + ' signal(s) ready!'
-      );
+    if (triggeredBy) {
+      if (found === 0) bot.sendMessage(ADMIN_ID, 'Scan complete — no qualifying tokens found. Next auto-scan in 30 mins.');
+      else bot.sendMessage(ADMIN_ID, 'Scan complete — found ' + found + ' token(s)! Check previews above.');
     }
   } catch(e) {
     console.error('Scan error:', e.message);
-    if (manual) bot.sendMessage(ADMIN_ID, '❌ Scan error: ' + e.message);
+    if (triggeredBy) bot.sendMessage(ADMIN_ID, 'Scan error: ' + e.message);
   } finally {
     isScanning = false;
   }
 }
 
-// ═══════════════════════════════════════════════
-//  SIGNAL FORMAT & POST
-// ═══════════════════════════════════════════════
-function fmtSignalPost(p, ca, rug, entry, t1, t2, sl) {
-  const name = p.baseToken.name;
-  const sym  = p.baseToken.symbol;
-  const mc   = p.fdv || 0;
-  const liq  = p.liquidity?.usd || 0;
-  const ageH = p.pairCreatedAt ? ((Date.now()-p.pairCreatedAt)/3600000).toFixed(1) : 'N/A';
-  const buys  = p.txns?.h24?.buys  || 0;
-  const sells = p.txns?.h24?.sells || 0;
-  const rs = rug?.score || 'N/A';
-  let socials = '';
-  if (p.info?.websites?.[0]) socials += '[Web](' + p.info.websites[0].url + ') ';
-  if (p.info?.socials) p.info.socials.forEach(s => {
-    if (s.type==='twitter')  socials += '[X](' + s.url + ') ';
-    if (s.type==='telegram') socials += '[TG](' + s.url + ') ';
-  });
-  if (!socials) socials = 'No socials';
-  return (
-    '📡 *SIGNAL ALERT* — @YakubuWeb3\n' +
-    '━━━━━━━━━━━━━━━━━━━\n' +
-    '🪙 *' + name + '* (' + sym + ') | SOLANA\n' +
-    '⏰ Age: ' + ageH + 'h\n\n' +
-    '💰 *Entry:* ' + fmtPrice(entry) + '\n' +
-    '💊 *MC:* ' + fmt(mc) + ' | 💧 *Liq:* ' + fmt(liq) + '\n\n' +
-    '🎯 *Targets:*\n' +
-    '├ T1: ' + fmtPrice(t1) + ' *(+50%)*\n' +
-    '└ T2: ' + fmtPrice(t2) + ' *(+100%)*\n' +
-    '🛑 *Stop Loss:* ' + fmtPrice(sl) + ' *(-20%)*\n\n' +
-    '📊 *Price Action:*\n' +
-    '├ 5m: ' + fmtPct(p.priceChange?.m5) + '\n' +
-    '├ 1h: ' + fmtPct(p.priceChange?.h1) + '\n' +
-    '└ 24h: ' + fmtPct(p.priceChange?.h24) + '\n\n' +
-    '📈 *Vol 1h:* ' + fmt(p.volume?.h1) + ' | *24h:* ' + fmt(p.volume?.h24) + '\n' +
-    '🛒 *Buys:* ' + buys + ' | 🔴 *Sells:* ' + sells + '\n\n' +
-    '🛡️ *Rug Score:* ' + rs + ' — ' + rugEmoji(rs) + '\n' +
-    '🔗 *Socials:* ' + socials + '\n\n' +
-    '📋 CA: `' + ca + '`\n' +
-    '[Chart](https://dexscreener.com/solana/' + ca + ') | [Trade](https://t.me/YakubuWeb3Bot?start=' + ca + ')\n' +
-    '━━━━━━━━━━━━━━━━━━━\n' +
-    '_DYOR — Not financial advice_\n' +
-    '_Signal by @YakubuWeb3_'
-  );
-}
-
-async function sendSignalForReview(ca, p, rug, analysis, isAuto) {
-  try {
-    const entry = parseFloat(p.priceUsd) || 0;
-    const t1 = entry * 1.5;
-    const t2 = entry * 2;
-    const sl = entry * 0.8;
-    const ageH = p.pairCreatedAt ? ((Date.now()-p.pairCreatedAt)/3600000).toFixed(1) : 'N/A';
-    const signalText = fmtSignalPost(p, ca, rug, entry, t1, t2, sl);
-    const analysisText = fmtAnalysis(analysis);
-    savePendingSignal(ca, { p, signalText, entry, t1, t2, sl });
-    await bot.sendMessage(ADMIN_ID,
-      (isAuto?'🔔':'👁️') + ' *SIGNAL PREVIEW* — ' + (isAuto?'🤖 AUTO':'👤 MANUAL') + '\n' +
-      '📊 Today: ' + getTodaySignalCount() + '/' + MAX_SIGNALS_PER_DAY + '\n' +
-      '⏰ Age: ' + ageH + 'h | ' + analysis.emoji + ' Score: ' + analysis.final + '/100\n\n' +
-      signalText + analysisText,
-      { parse_mode:'Markdown', disable_web_page_preview:true,
-        reply_markup:{inline_keyboard:[[{text:'✅ APPROVE',callback_data:'approve_'+ca},{text:'❌ REJECT',callback_data:'reject_'+ca}]]}
-      }
-    );
-  } catch(e) { console.error('sendSignalForReview:', e.message); if(!isAuto) bot.sendMessage(ADMIN_ID,'❌ Error: '+e.message); }
-}
-
-async function postToChannel(ca, msgId) {
-  const pending = getPendingSignal(ca);
-  if (!pending) return bot.sendMessage(ADMIN_ID, '⚠️ Signal expired! Use /signal <CA> to re-analyze.');
-  if (getTodaySignalCount() >= MAX_SIGNALS_PER_DAY) return bot.sendMessage(ADMIN_ID, '❌ Max signals today!');
-  try {
-    await bot.sendMessage(CHANNEL_ID, pending.signal_text, {
-      parse_mode:'Markdown', disable_web_page_preview:true,
-      reply_markup:{inline_keyboard:[[{text:'Chart',url:'https://dexscreener.com/solana/'+ca},{text:'Analyze',url:'https://t.me/YakubuWeb3Bot?start='+ca}]]}
-    });
-    recordSignalSent(ca);
-    saveSnapshot(CHANNEL_ID, ca, pending.entry_price, pending.token_fdv, pending.token_name, pending.token_symbol);
-    openPaperTrade(ca, pending.token_name, pending.token_symbol, pending.entry_price, pending.token_fdv, pending.target1, pending.target2, pending.stop_loss);
-    deletePendingSignal(ca);
-    const cnt = getTodaySignalCount();
-    await bot.editMessageText('✅ Posted! ('+cnt+'/'+MAX_SIGNALS_PER_DAY+' today)\n\n'+pending.signal_text,
-      {chat_id:ADMIN_ID, message_id:msgId, parse_mode:'Markdown', disable_web_page_preview:true});
-  } catch(e) { bot.sendMessage(ADMIN_ID,'❌ Failed to post! Check bot is admin in channel.'); console.error(e); }
-}
-
-// ═══════════════════════════════════════════════
-//  TRADE MONITORING
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  TRADE MONITORING — Road Map 2 enhanced progress posts
+// ═══════════════════════════════════════════════════════════
 async function checkOpenTrades() {
   const trades = getOpenTrades();
-  if (!trades.length) return;
+  if (trades.length === 0) return;
   for (const trade of trades) {
     try {
       const p = await getTokenData(trade.ca);
       if (!p) continue;
-      const cur = parseFloat(p.priceUsd) || 0;
-      if (!cur) continue;
-
-      const pnlPct = ((cur - trade.entry_price) / trade.entry_price) * 100;
+      const currentPrice = parseFloat(p.priceUsd) || 0;
+      if (currentPrice === 0) continue;
+      const pnlPct = ((currentPrice - trade.entry_price) / trade.entry_price) * 100;
       const pnlSol = (pnlPct / 100) * trade.sol_amount;
-      const toT2   = ((trade.target2 - cur) / trade.target2 * 100).toFixed(1);
-      const t1Hit  = trade.result === 'T1_partial' || trade.result === 'T1_progress' || trade.result === 'T2';
+      const toT1 = ((trade.target1 - currentPrice) / trade.target1 * 100).toFixed(1);
+      const toT2 = ((trade.target2 - currentPrice) / trade.target2 * 100).toFixed(1);
 
-      // ── After T1 hit — SL moves to entry price ──
-      // Only close if price falls BELOW entry (after T1)
-      // No SL warning after T1 — silent protection
-
-      // ── TARGET 2 HIT (+100%) ──
-      if (cur >= trade.target2) {
-        closePaperTrade(trade.id, 'T2', pnlPct, pnlSol);
-        await bot.sendMessage(CHANNEL_ID,
-          '🏆 *TARGET 2 HIT! +100%* 🏆\n' +
-          '━━━━━━━━━━━━━━━━━━━\n' +
-          '🪙 *' + trade.name + '* (' + trade.symbol + ')\n\n' +
-          '📥 Entry: ' + fmtPrice(trade.entry_price) + '\n' +
-          '📤 Exit: ' + fmtPrice(cur) + '\n' +
-          '✅ PNL: +' + pnlPct.toFixed(1) + '% (+' + pnlSol.toFixed(3) + ' SOL)\n' +
-          '📊 Multiplier: ' + (cur/trade.entry_price).toFixed(2) + 'x\n\n' +
-          '_Signal by @YakubuWeb3_',
-          { parse_mode: 'Markdown' }
-        );
-        continue;
-      }
-
-      // ── TARGET 1 HIT (+50%) — first time ──
-      if (cur >= trade.target1 && !t1Hit) {
-        // Move SL to entry price silently
-        db.prepare('UPDATE paper_trades SET result = ?, stop_loss = ? WHERE id = ?').run('T1_partial', trade.entry_price, trade.id);
-        await bot.sendMessage(CHANNEL_ID,
-          '🎯 *TARGET 1 HIT! +50%*\n' +
-          '━━━━━━━━━━━━━━━━━━━\n' +
-          '🪙 *' + trade.name + '* (' + trade.symbol + ')\n\n' +
-          '📥 Entry: ' + fmtPrice(trade.entry_price) + '\n' +
-          '📍 Now: ' + fmtPrice(cur) + '\n' +
-          '✅ PNL: +' + pnlPct.toFixed(1) + '% (+' + pnlSol.toFixed(3) + ' SOL)\n\n' +
-          '👀 Watching T2 (+100%)...\n' +
-          '🛡️ SL moved to entry — protected!\n\n' +
-          '_Signal by @YakubuWeb3_',
-          { parse_mode: 'Markdown' }
-        );
-        continue;
-      }
-
-      // ── AFTER T1: price fell back to entry or below — close silently ──
-      if (t1Hit && cur <= trade.entry_price) {
-        closePaperTrade(trade.id, 'T1', pnlPct, pnlSol);
-        // No channel post — T1 was already celebrated, this is just closing
-        console.log('Trade closed at entry after T1:', trade.name, pnlPct.toFixed(1) + '%');
-        continue;
-      }
-
-      // ── BEFORE T1: SL HIT (-20%) ──
-      if (!t1Hit && cur <= trade.stop_loss) {
+      if (currentPrice <= trade.stop_loss) {
         closePaperTrade(trade.id, 'SL', pnlPct, pnlSol);
         await bot.sendMessage(CHANNEL_ID,
           '🔴 *STOP LOSS HIT*\n' +
           '━━━━━━━━━━━━━━━━━━━\n' +
           '🪙 *' + trade.name + '* (' + trade.symbol + ')\n\n' +
           '📥 Entry: ' + fmtPrice(trade.entry_price) + '\n' +
-          '📤 Exit: ' + fmtPrice(cur) + '\n' +
+          '📤 Exit: ' + fmtPrice(currentPrice) + '\n' +
           '📉 PNL: ' + pnlPct.toFixed(1) + '% (' + pnlSol.toFixed(3) + ' SOL)\n\n' +
           '_Signal by @YakubuWeb3_',
           { parse_mode: 'Markdown' }
@@ -759,381 +904,482 @@ async function checkOpenTrades() {
         continue;
       }
 
-      // ── BEFORE T1: SL WARNING (-15%) ──
-      if (!t1Hit && pnlPct <= -15 && trade.result !== 'sl_warning') {
+      if (currentPrice >= trade.target2) {
+        closePaperTrade(trade.id, 'T2', pnlPct, pnlSol);
+        await bot.sendMessage(CHANNEL_ID,
+          '🏆 *TARGET 2 HIT! +100%* 🏆\n' +
+          '━━━━━━━━━━━━━━━━━━━\n' +
+          '🪙 *' + trade.name + '* (' + trade.symbol + ')\n\n' +
+          '📥 Entry: ' + fmtPrice(trade.entry_price) + '\n' +
+          '📤 Exit: ' + fmtPrice(currentPrice) + '\n' +
+          '✅ PNL: +' + pnlPct.toFixed(1) + '% (+' + pnlSol.toFixed(3) + ' SOL)\n' +
+          '📊 Multiplier: ' + (currentPrice / trade.entry_price).toFixed(2) + 'x\n\n' +
+          '_Signal by @YakubuWeb3_',
+          { parse_mode: 'Markdown' }
+        );
+        continue;
+      }
+
+      if (currentPrice >= trade.target1 && trade.result !== 'T1_partial') {
+        db.prepare('UPDATE paper_trades SET result = ? WHERE id = ?').run('T1_partial', trade.id);
+        await bot.sendMessage(CHANNEL_ID,
+          '🎯 *TARGET 1 HIT! +50%*\n' +
+          '━━━━━━━━━━━━━━━━━━━\n' +
+          '🪙 *' + trade.name + '* (' + trade.symbol + ')\n\n' +
+          '📥 Entry: ' + fmtPrice(trade.entry_price) + '\n' +
+          '📍 Now: ' + fmtPrice(currentPrice) + '\n' +
+          '✅ PNL: +' + pnlPct.toFixed(1) + '% (+' + pnlSol.toFixed(3) + ' SOL)\n\n' +
+          '👀 Watching for T2 (+100%)...\n' +
+          '🛑 Stop Loss: ' + fmtPrice(trade.stop_loss) + '\n\n' +
+          '_Signal by @YakubuWeb3_',
+          { parse_mode: 'Markdown' }
+        );
+        continue;
+      }
+
+      if (pnlPct <= -15 && trade.result !== 'sl_warning' && trade.result !== 'T1_partial') {
         db.prepare('UPDATE paper_trades SET result = ? WHERE id = ?').run('sl_warning', trade.id);
         await bot.sendMessage(CHANNEL_ID,
           '⚠️ *STOP LOSS WARNING*\n' +
           '━━━━━━━━━━━━━━━━━━━\n' +
           '🪙 *' + trade.name + '* (' + trade.symbol + ')\n\n' +
-          '📍 Now: ' + fmtPrice(cur) + '\n' +
-          '📉 PNL: ' + pnlPct.toFixed(1) + '% (' + pnlSol.toFixed(3) + ' SOL)\n' +
-          '🛑 SL approaching: ' + fmtPrice(trade.stop_loss) + '\n\n' +
+          '📥 Entry: ' + fmtPrice(trade.entry_price) + '\n' +
+          '📍 Now: ' + fmtPrice(currentPrice) + '\n' +
+          '📉 PNL: ' + pnlPct.toFixed(1) + '% (' + pnlSol.toFixed(3) + ' SOL)\n\n' +
+          '🛑 Stop Loss approaching: ' + fmtPrice(trade.stop_loss) + '\n' +
+          '⚡ Consider cutting losses!\n\n' +
           '_Signal by @YakubuWeb3_',
           { parse_mode: 'Markdown' }
         );
         continue;
       }
 
-      // ── PROGRESS +30% (before T1) ──
-      if (!t1Hit && pnlPct >= 30 && trade.result !== 'progress_30') {
+      if (pnlPct >= 30 && trade.result !== 'T1_partial' && trade.result !== 'progress_30') {
         db.prepare('UPDATE paper_trades SET result = ? WHERE id = ?').run('progress_30', trade.id);
-        const toT1 = ((trade.target1 - cur) / trade.target1 * 100).toFixed(1);
         await bot.sendMessage(CHANNEL_ID,
           '📈 *UPDATE — ' + trade.name + ' (' + trade.symbol + ')*\n' +
           '━━━━━━━━━━━━━━━━━━━\n\n' +
           '✅ Up +' + pnlPct.toFixed(1) + '% (+' + pnlSol.toFixed(3) + ' SOL)\n\n' +
-          '🎯 T1 (+50%): ' + toT1 + '% away\n' +
-          '🏆 T2 (+100%): ' + toT2 + '% away\n\n' +
+          '🎯 *T1 (+50%):* ' + toT1 + '% remaining\n' +
+          '🏆 *T2 (+100%):* ' + toT2 + '% remaining\n' +
+          '🛑 *Stop Loss:* ' + fmtPrice(trade.stop_loss) + '\n\n' +
           '_Signal by @YakubuWeb3_',
           { parse_mode: 'Markdown' }
         );
         continue;
       }
 
-      // ── PROGRESS +20% (before T1) ──
-      if (!t1Hit && pnlPct >= 20 && !['progress_30','progress_20'].includes(trade.result)) {
+      if (pnlPct >= 20 && trade.result !== 'T1_partial' && trade.result !== 'progress_30' && trade.result !== 'progress_20') {
         db.prepare('UPDATE paper_trades SET result = ? WHERE id = ?').run('progress_20', trade.id);
-        const toT1 = ((trade.target1 - cur) / trade.target1 * 100).toFixed(1);
         await bot.sendMessage(CHANNEL_ID,
           '📈 *UPDATE — ' + trade.name + ' (' + trade.symbol + ')*\n' +
           '━━━━━━━━━━━━━━━━━━━\n\n' +
           '✅ Up +' + pnlPct.toFixed(1) + '% (+' + pnlSol.toFixed(3) + ' SOL)\n\n' +
-          '🎯 T1 (+50%): ' + toT1 + '% away\n' +
-          '🏆 T2 (+100%): ' + toT2 + '% away\n\n' +
+          '🎯 *T1 (+50%):* ' + toT1 + '% remaining\n' +
+          '🏆 *T2 (+100%):* ' + toT2 + '% remaining\n' +
+          '🛑 *Stop Loss:* ' + fmtPrice(trade.stop_loss) + '\n\n' +
           '_Signal by @YakubuWeb3_',
           { parse_mode: 'Markdown' }
         );
         continue;
       }
 
-      await new Promise(r => setTimeout(r, 800));
+      await new Promise(r => setTimeout(r, 1000));
     } catch(e) { console.error('Trade check error:', e.message); }
   }
 }
 
-// ═══════════════════════════════════════════════
-//  TOKEN ANALYSIS
-// ═══════════════════════════════════════════════
-async function sendAnalysis(chatId, ca, username) {
-  trackUserActivity(chatId, username, ca);
-  const load = await bot.sendMessage(chatId, '🔍 Analyzing token...');
-  try {
-    const p = await getTokenData(ca);
-    if (!p) { await bot.deleteMessage(chatId,load.message_id); return bot.sendMessage(chatId,'❌ Token not found! Check CA is correct.'); }
-    const rug = await getRugcheck(ca);
-    const analysis = calcTokenStrength(p, rug);
-    saveSnapshot(chatId, ca, parseFloat(p.priceUsd)||0, p.fdv||0, p.baseToken.name, p.baseToken.symbol);
-    const mc = p.fdv||0, liq = p.liquidity?.usd||0;
-    const ageH = p.pairCreatedAt ? ((Date.now()-p.pairCreatedAt)/3600000).toFixed(1)+'h' : 'N/A';
-    const buys=p.txns?.h24?.buys||0, sells=p.txns?.h24?.sells||0;
-    const rs = rug?.score||'N/A';
-    let socials='';
-    if(p.info?.websites?.[0]) socials+='[Web]('+p.info.websites[0].url+') ';
-    if(p.info?.socials) p.info.socials.forEach(s=>{if(s.type==='twitter')socials+='[X]('+s.url+') ';if(s.type==='telegram')socials+='[TG]('+s.url+') ';});
-    if(!socials)socials='No socials';
-    const holders=rug?.topHolders||rug?.holders||[];
-    let top10str='N/A';
-    if(holders.length){const list=holders.map(h=>Number(h.pct||h.percentage||h.share||0)).filter(x=>x>0&&x<60).sort((a,b)=>b-a);if(list.length)top10str=Math.min(list.slice(0,10).reduce((a,b)=>a+b,0),100).toFixed(1)+'%';}
-    const devH=rug?.creator?(rug?.topHolders||[]).find(h=>h.address===rug.creator):null;
-    const devInfo=devH?(devH.pct||0).toFixed(1)+'%':(rug?.creator?'0%':'N/A');
-    const bundleInfo=rug?.insiderNetworks?.length?rug.insiderNetworks.length+' bundles ('+rug.insiderNetworks.reduce((a,b)=>a+(b.holdingPercent||0),0).toFixed(1)+'%)':'None';
-    const text='🔍 *'+p.baseToken.name+'* ('+p.baseToken.symbol+')\n⏰ Age: '+ageH+' | 🏦 '+(p.dexId||'N/A')+'\n\n💰 *Price:* '+fmtPrice(p.priceUsd)+'\n💊 *MC:* '+fmt(mc)+' | 💧 *Liq:* '+fmt(liq)+'\n\n📈 *Volume:*\n├ 1h: '+fmt(p.volume?.h1)+'\n├ 6h: '+fmt(p.volume?.h6)+'\n└ 24h: '+fmt(p.volume?.h24)+'\n\n📉 *Change:*\n├ 5m: '+fmtPct(p.priceChange?.m5)+'\n├ 1h: '+fmtPct(p.priceChange?.h1)+'\n└ 24h: '+fmtPct(p.priceChange?.h24)+'\n\n🛒 *Buys 24h:* '+buys+' | 🔴 *Sells:* '+sells+'\n🔗 *Socials:* '+socials+'\n\n👥 *Top 10 holders:* '+top10str+'\n🔧 *Dev:* '+devInfo+'\n📦 *Bundles:* '+bundleInfo+'\n\n🛡️ *Rug Score:* '+rs+' — '+rugEmoji(rs)+fmtAnalysis(analysis, true)+'\n📋 `'+ca+'`\n_/pnl '+ca+'_';
-    await bot.deleteMessage(chatId, load.message_id);
-    const isAdmin=String(chatId)===String(ADMIN_ID);
-    const kb=isAdmin?[[{text:'Refresh',callback_data:'refresh_'+ca},{text:'Delete',callback_data:'delete'},{text:'Chart',url:'https://dexscreener.com/solana/'+ca}],[{text:'PNL Card',callback_data:'pnl_'+ca},{text:'Send as Signal',callback_data:'signal_'+ca}]]:[[{text:'Refresh',callback_data:'refresh_'+ca},{text:'Delete',callback_data:'delete'},{text:'Chart',url:'https://dexscreener.com/solana/'+ca}],[{text:'PNL Card',callback_data:'pnl_'+ca}]];
-    await bot.sendMessage(chatId, text, {parse_mode:'Markdown',disable_web_page_preview:true,reply_markup:{inline_keyboard:kb}});
-  } catch(e) { try{await bot.deleteMessage(chatId,load.message_id);}catch(_){} bot.sendMessage(chatId,'❌ Error. Try again.'); console.error('sendAnalysis:',e.message); }
+// ═══════════════════════════════════════════════════════════
+//  WEEKLY REPORT
+// ═══════════════════════════════════════════════════════════
+async function sendWeeklyReport() {
+  const stats = getWeeklyStats();
+  if (!stats) return;
+  const msg =
+    '*WEEKLY SIGNAL REPORT*\n' +
+    '-------------------\n\n' +
+    'Last 7 days:\n' +
+    'Total Signals: ' + stats.total + '\n' +
+    'Wins: ' + stats.wins + '/' + stats.total + '\n' +
+    'Win Rate: ' + stats.winRate + '%\n' +
+    'Total PNL: ' + (parseFloat(stats.totalPnlSol) > 0 ? '+' : '') + stats.totalPnlSol + ' SOL\n' +
+    (stats.bestTrade ? 'Best Trade: ' + stats.bestTrade.symbol + ' +' + (stats.bestTrade.pnl_pct || 0).toFixed(1) + '%\n' : '') +
+    '\n_Signal by @YakubuWeb3_';
+  await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'Markdown' });
 }
 
-// ═══════════════════════════════════════════════
-//  PNL CARD
-// ═══════════════════════════════════════════════
+function scheduleWeeklyReport() {
+  setInterval(() => {
+    const now = new Date();
+    if (now.getDay() === 0 && now.getHours() === 8 && now.getMinutes() < 30) sendWeeklyReport();
+  }, 30 * 60 * 1000);
+}
+
+// ═══════════════════════════════════════════════════════════
+//  MESSAGE FORMATTERS
+// ═══════════════════════════════════════════════════════════
+async function formatMsg(p, ca, chatId) {
+  const name   = p.baseToken.name;
+  const symbol = p.baseToken.symbol;
+  const price  = parseFloat(p.priceUsd) || 0;
+  const mc     = p.fdv || 0;
+  saveSnapshot(chatId, ca, price, mc, name, symbol);
+  const vol24 = fmt(p.volume?.h24);
+  const vol6  = fmt(p.volume?.h6);
+  const vol1  = fmt(p.volume?.h1);
+  const ch24  = fmtChangeEmoji(p.priceChange?.h24);
+  const ch6   = fmtChangeEmoji(p.priceChange?.h6);
+  const ch1   = fmtChangeEmoji(p.priceChange?.h1);
+  const created  = p.pairCreatedAt ? Math.floor((Date.now() - p.pairCreatedAt) / 86400000) + 'd ago' : 'N/A';
+  const chain    = (p.chainId || '').toUpperCase();
+  const dex      = p.dexId || 'N/A';
+  const buys     = p.txns?.h24?.buys  || 0;
+  const sells    = p.txns?.h24?.sells || 0;
+  const dexPaid  = checkDexPaid(p) ? 'Paid' : 'Not Paid';
+  let socials = '';
+  if (p.info?.websites?.length > 0) socials += '[Web](' + p.info.websites[0].url + ') ';
+  if (p.info?.socials?.length > 0) p.info.socials.forEach(s => {
+    if (s.type === 'twitter') socials += '[X](' + s.url + ') ';
+    if (s.type === 'telegram') socials += '[TG](' + s.url + ') ';
+  });
+  if (!socials) socials = 'No socials';
+  const rug = await getRugcheck(ca);
+  let riskScore = 'N/A', riskLevel = 'N/A', bundleInfo = 'No bundles', sniperInfo = 'No snipers';
+  let athMc = 'N/A', risks = 'Clean', devInfo = 'N/A', holdersCount = 'N/A', top10 = 'N/A', top20 = 'N/A';
+  if (rug) {
+    riskScore = rug.score || 0;
+    riskLevel = getRugEmoji(riskScore);
+    if (rug.markets?.length > 0) { const maxMc = Math.max(...rug.markets.map(m => m.marketCap || 0)); if (maxMc > 0) athMc = fmt(maxMc); }
+    holdersCount = await getHolderCount(ca, rug);
+    const holdersData = rug?.topHolders || rug?.holders || rug?.data?.holders || [];
+    if (Array.isArray(holdersData) && holdersData.length > 0) {
+      const list = holdersData.map(h => ({ address: h.address || '', pct: Number(h.pct || h.percentage || h.share || 0) })).filter(h => h.address && h.pct > 0 && h.pct < 50).sort((a, b) => b.pct - a.pct);
+      if (list.length > 0) {
+        top10 = Math.min(list.slice(0, 10).reduce((a, b) => a + b.pct, 0), 100).toFixed(1) + '%';
+        top20 = Math.min(list.slice(0, 20).reduce((a, b) => a + b.pct, 0), 100).toFixed(1) + '%';
+      }
+    }
+    if (rug.creator) { const devBal = rug.creatorBalance ? (rug.creatorBalance / 1e9).toFixed(1) + ' SOL' : '0 SOL'; const devH = (rug?.topHolders || []).find(h => h.address === rug.creator); devInfo = devBal + ' ' + (devH ? devH.pct?.toFixed(1) + '%' : '0%'); }
+    if (rug.insiderNetworks?.length > 0) { const count = rug.insiderNetworks.length; const bPct = rug.insiderNetworks.reduce((a, b) => a + (b.holdingPercent || 0), 0); const nPct = rug.insiderNetworks.reduce((a, b) => a + (b.currentHoldingPercent || 0), 0); bundleInfo = count + ' bundles ' + bPct.toFixed(1) + '% bought ' + nPct.toFixed(1) + '% now' + (bPct > 20 ? ' WARNING' : ''); }
+    if (rug.snipers?.length > 0) { const count = rug.snipers.length; const bPct = rug.snipers.reduce((a, b) => a + (b.holdingPercent || 0), 0); const nPct = rug.snipers.reduce((a, b) => a + (b.currentHoldingPercent || 0), 0); sniperInfo = count + ' snipers ' + bPct.toFixed(1) + '% bought ' + nPct.toFixed(1) + '% now'; }
+    if (rug.risks?.length > 0) { risks = ''; rug.risks.slice(0, 3).forEach(r => { const icon = r.level === 'danger' ? '🔴' : r.level === 'warn' ? '⚠️' : '📝'; risks += icon + ' ' + r.name + '\n'; }); }
+  }
+  return '🔍 *' + name + '* (' + symbol + ')\n🔗 ' + chain + ' | 🏦 ' + dex + ' | ⏰ ' + created + '\n\n💰 *Price:* ' + fmtPrice(price) + '\n💊 *MC:* ' + fmt(mc) + ' | 💧 *Liq:* ' + fmt(p.liquidity?.usd) + '\n🏆 *ATH MC:* ' + athMc + '\n\n📈 *Volume:*\n├ 24h: ' + vol24 + '\n├ 6h: ' + vol6 + '\n└ 1h: ' + vol1 + '\n\n📉 *Change:*\n├ 24h: ' + ch24 + '\n├ 6h: ' + ch6 + '\n└ 1h: ' + ch1 + '\n\n🛒 *Buys:* ' + buys + ' | 🔴 *Sells:* ' + sells + '\n⚡ *Dex:* ' + dexPaid + '\n🔗 *Socials:* ' + socials + '\n\n👥 *Holders:* ' + holdersCount + '\n├ Top 10: ' + top10 + '\n└ Top 20: ' + top20 + '\n🔧 *Dev:* ' + devInfo + '\n\n📦 *Bundles:* ' + bundleInfo + '\n🎯 *Snipers:* ' + sniperInfo + '\n\n🛡️ *Risk Score:* ' + riskScore + ' — ' + riskLevel + '\n⚠️ *Flags:*\n' + risks + '\n📋 `' + ca + '`\n_💰 /pnl ' + ca + '_';
+}
+
+function formatSignalPost(p, ca, rug, entryPrice, target1, target2, stopLoss) {
+  const name     = p.baseToken.name;
+  const symbol   = p.baseToken.symbol;
+  const mc       = p.fdv || 0;
+  const liq      = p.liquidity?.usd || 0;
+  const ageHours = p.pairCreatedAt ? ((Date.now() - p.pairCreatedAt) / (1000 * 60 * 60)).toFixed(1) : 'N/A';
+  const ch5m     = fmtChangeEmoji(p.priceChange?.m5);
+  const ch1      = fmtChangeEmoji(p.priceChange?.h1);
+  const ch24     = fmtChangeEmoji(p.priceChange?.h24);
+  const buys     = p.txns?.h24?.buys  || 0;
+  const sells    = p.txns?.h24?.sells || 0;
+  const chain    = (p.chainId || '').toUpperCase();
+  let riskScore = 'N/A', rugBadge = '⚪ UNKNOWN';
+  if (rug) { riskScore = rug.score || 0; rugBadge = getRugEmoji(riskScore); }
+  let socials = '';
+  if (p.info?.websites?.length > 0) socials += '[Web](' + p.info.websites[0].url + ') ';
+  if (p.info?.socials?.length > 0) p.info.socials.forEach(s => { if (s.type === 'twitter') socials += '[X](' + s.url + ') '; if (s.type === 'telegram') socials += '[TG](' + s.url + ') '; });
+  if (!socials) socials = 'No socials';
+  return '📡 *SIGNAL ALERT* — @YakubuWeb3\n━━━━━━━━━━━━━━━━━━━\n🪙 *' + name + '* (' + symbol + ') | ' + chain + '\n⏰ Age: ' + ageHours + 'h | 🏦 Pumpswap\n\n💰 *Entry:* ' + fmtPrice(entryPrice) + '\n💊 *MC:* ' + fmt(mc) + ' | 💧 *Liq:* ' + fmt(liq) + '\n\n🎯 *Targets:*\n├ T1: ' + fmtPrice(target1) + ' *(+50%)*\n└ T2: ' + fmtPrice(target2) + ' *(+100%)*\n🛑 *Stop Loss:* ' + fmtPrice(stopLoss) + ' *(-20%)*\n\n📊 *Price Action:*\n├ 5m: ' + ch5m + '\n├ 1h: ' + ch1 + '\n└ 24h: ' + ch24 + '\n\n📈 *Vol 24h:* ' + fmt(p.volume?.h24) + '\n🛒 *Buys:* ' + buys + ' | 🔴 *Sells:* ' + sells + '\n\n🛡️ *Rug Score:* ' + riskScore + ' — ' + rugBadge + '\n🔗 *Socials:* ' + socials + '\n\n📋 CA: `' + ca + '`\n[Chart](https://dexscreener.com/solana/' + ca + ') | [Analyze](https://t.me/YakubuWeb3Bot?start=' + ca + ')\n━━━━━━━━━━━━━━━━━━━\n_DYOR — Not financial advice_\n_Signal by @YakubuWeb3_';
+}
+
+// ═══════════════════════════════════════════════════════════
+//  SIGNAL REVIEW & POSTING
+// ═══════════════════════════════════════════════════════════
+async function sendSignalForReview(ca, existingP, existingRug, isAutoScan, existingAnalysis) {
+  try {
+    const p = existingP || await getTokenData(ca);
+    if (!p) { if (!isAutoScan) bot.sendMessage(ADMIN_ID, 'Token not found!'); return; }
+    const rug = existingRug || await getRugcheck(ca);
+    const analysis = existingAnalysis || calcTokenStrength(p, rug);
+    const entryPrice = parseFloat(p.priceUsd) || 0;
+    const target1    = entryPrice * 1.5;
+    const target2    = entryPrice * 2;
+    const stopLoss   = entryPrice * 0.8;
+    const signalText     = formatSignalPost(p, ca, rug, entryPrice, target1, target2, stopLoss);
+    const analysisReport = formatAnalysisReport(analysis);
+    const aiExplanation  = await getAIExplanation(p, analysis); // NEW
+    const ageHours = p.pairCreatedAt ? ((Date.now() - p.pairCreatedAt) / (1000 * 60 * 60)).toFixed(1) : 'N/A';
+    pendingSignals[ca] = { p, rug, analysis, signalText, entryPrice, target1, target2, stopLoss };
+    const badge        = isAutoScan ? '🤖 AUTO SCAN' : '👤 MANUAL';
+    const scoreDisplay = '\n' + analysis.gradeEmoji + ' Score: ' + analysis.finalScore + '/100 — Grade ' + analysis.grade;
+    const aiBlock = aiExplanation ? ('\n🤖 *AI Take:* ' + aiExplanation + '\n') : '';
+    await bot.sendMessage(ADMIN_ID,
+      (isAutoScan ? '🔔' : '👁️') + ' *SIGNAL PREVIEW* — ' + badge + '\n' +
+      '📊 Today: ' + getTodaySignalCount() + '/' + MAX_SIGNALS_PER_DAY + '\n' +
+      '⏰ Age: ' + ageHours + 'h' + scoreDisplay + aiBlock + '\n\n' +
+      signalText + '\n' + analysisReport,
+      { parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: { inline_keyboard: [[{ text: '✅ APPROVE — Post to Channel', callback_data: 'approve_' + ca }, { text: '❌ REJECT', callback_data: 'reject_' + ca }]] } }
+    );
+  } catch(e) {
+    console.error('Signal review error:', e.message);
+    if (!isAutoScan) bot.sendMessage(ADMIN_ID, 'Error preparing signal!');
+  }
+}
+
+async function postSignalToChannel(ca, msgId) {
+  const pending = pendingSignals[ca];
+  if (!pending) return bot.sendMessage(ADMIN_ID, 'Signal expired! Re-analyze the token.');
+  if (getTodaySignalCount() >= MAX_SIGNALS_PER_DAY) return bot.sendMessage(ADMIN_ID, 'Max signals reached today!');
+  try {
+    await bot.sendMessage(CHANNEL_ID, pending.signalText, {
+      parse_mode: 'Markdown', disable_web_page_preview: true,
+      reply_markup: { inline_keyboard: [[{ text: 'Chart', url: 'https://dexscreener.com/solana/' + ca }, { text: 'Analyze', url: 'https://t.me/YakubuWeb3Bot?start=' + ca }]] }
+    });
+    recordSignalSent(ca);
+    saveSnapshot(CHANNEL_ID, ca, pending.entryPrice, pending.p.fdv || 0, pending.p.baseToken.name, pending.p.baseToken.symbol);
+    openPaperTrade(ca, pending.p.baseToken.name, pending.p.baseToken.symbol, pending.entryPrice, pending.p.fdv || 0, pending.target1, pending.target2, pending.stopLoss);
+    delete pendingSignals[ca];
+    const newCount = getTodaySignalCount();
+    await bot.editMessageText('Signal posted to channel!\nToday: ' + newCount + '/' + MAX_SIGNALS_PER_DAY + '\n\n' + pending.signalText, { chat_id: ADMIN_ID, message_id: msgId, parse_mode: 'Markdown', disable_web_page_preview: true });
+    bot.sendMessage(ADMIN_ID, 'Signal posted! (' + newCount + '/' + MAX_SIGNALS_PER_DAY + ' today)');
+  } catch(e) { bot.sendMessage(ADMIN_ID, 'Failed to post! Check bot is admin in channel.'); console.error(e); }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ANALYSIS & PNL
+// ═══════════════════════════════════════════════════════════
+async function sendAnalysis(chatId, ca, username) {
+  const loadMsg = await bot.sendMessage(chatId, 'Analyzing token...');
+  try {
+    const p = await getTokenData(ca);
+    if (!p) { await bot.deleteMessage(chatId, loadMsg.message_id); return bot.sendMessage(chatId, 'Token not found!'); }
+    const text = await formatMsg(p, ca, chatId);
+    await bot.deleteMessage(chatId, loadMsg.message_id);
+    const isAdmin = String(chatId) === String(ADMIN_ID);
+    const keyboard = isAdmin
+      ? [[{ text: 'Refresh', callback_data: 'refresh_' + ca }, { text: 'Delete', callback_data: 'delete' }, { text: 'Chart', url: 'https://dexscreener.com/solana/' + ca }],[{ text: 'PNL Card', callback_data: 'pnl_' + ca }, { text: 'Send as Signal', callback_data: 'signal_' + ca }]]
+      : [[{ text: 'Refresh', callback_data: 'refresh_' + ca }, { text: 'Delete', callback_data: 'delete' }, { text: 'Chart', url: 'https://dexscreener.com/solana/' + ca }],[{ text: 'PNL Card', callback_data: 'pnl_' + ca }]];
+    await bot.sendMessage(chatId, text, { parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: { inline_keyboard: keyboard } });
+  } catch(e) {
+    try { await bot.deleteMessage(chatId, loadMsg.message_id); } catch(err) {}
+    bot.sendMessage(chatId, 'Error! Try again.');
+    console.error(e);
+  }
+}
+
+async function generatePnlImage(data) {
+  const { name, symbol, entryMc, currentMc, entryPrice, currentPrice, pnlPct, multiplier, isProfit, username, entryTime } = data;
+  const W = 800, H = 450;
+  const img = new Jimp(W, H, isProfit ? 0x0a2a1aff : 0x2a0a0aff);
+  const borderColor = isProfit ? 0x00ff88ff : 0xff4444ff;
+  for (let x = 0; x < W; x++) { for (let t = 0; t < 4; t++) { img.setPixelColor(borderColor, x, t); img.setPixelColor(borderColor, x, H - 1 - t); } }
+  for (let y = 0; y < H; y++) { for (let t = 0; t < 4; t++) { img.setPixelColor(borderColor, t, y); img.setPixelColor(borderColor, W - 1 - t, y); } }
+  const font64 = await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE);
+  const font32 = await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE);
+  const font16 = await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
+  img.print(font32, 40, 35,  name + ' (' + symbol + ')');
+  img.print(font64, 40, 90,  (isProfit ? '+' : '') + pnlPct.toFixed(1) + '%');
+  img.print(font32, 40, 175, multiplier.toFixed(2) + 'x');
+  img.print(font16, 40, 240, 'Entry MC:      ' + fmt(entryMc));
+  img.print(font16, 40, 265, 'Current MC:    ' + fmt(currentMc));
+  img.print(font16, 40, 295, 'Entry Price:   ' + fmtPrice(entryPrice));
+  img.print(font16, 40, 320, 'Current Price: ' + fmtPrice(currentPrice));
+  const timeAgo = Math.floor((Date.now() - entryTime) / 60000);
+  img.print(font16, 40, 360, 'Called: ' + (timeAgo < 60 ? timeAgo + 'm ago' : Math.floor(timeAgo / 60) + 'h ' + (timeAgo % 60) + 'm ago'));
+  img.print(font16, 40, 390, '@' + (username || 'Anonymous'));
+  img.print(font16, W - 220, H - 25, '@YakubuWeb3Bot');
+  const filePath = '/tmp/pnl_' + Date.now() + '.png';
+  await img.writeAsync(filePath);
+  return filePath;
+}
+
 async function sendPnl(chatId, ca, username) {
   const snap = getSnapshot(chatId, ca);
-  if (!snap) return bot.sendMessage(chatId, '❌ No entry found! Send the CA first.');
-  const load = await bot.sendMessage(chatId, '🎨 Generating PNL card...');
+  if (!snap) return bot.sendMessage(chatId, 'No entry found! Send the CA first.');
+  const loadMsg = await bot.sendMessage(chatId, 'Generating PNL card...');
   try {
     const p = await getTokenData(ca);
-    if (!p) { await bot.deleteMessage(chatId,load.message_id); return bot.sendMessage(chatId,'❌ Token not found!'); }
-    const cur=parseFloat(p.priceUsd)||0, curMc=p.fdv||0;
-    const pnlPct=((cur-snap.price)/snap.price)*100, mult=cur/snap.price, isProfit=pnlPct>=0;
-    const W=800,H=450,img=new Jimp(W,H,isProfit?0x0a2a1aff:0x2a0a0aff),bc=isProfit?0x00ff88ff:0xff4444ff;
-    for(let x=0;x<W;x++){for(let t=0;t<4;t++){img.setPixelColor(bc,x,t);img.setPixelColor(bc,x,H-1-t);}}
-    for(let y=0;y<H;y++){for(let t=0;t<4;t++){img.setPixelColor(bc,t,y);img.setPixelColor(bc,W-1-t,y);}}
-    const f64=await Jimp.loadFont(Jimp.FONT_SANS_64_WHITE),f32=await Jimp.loadFont(Jimp.FONT_SANS_32_WHITE),f16=await Jimp.loadFont(Jimp.FONT_SANS_16_WHITE);
-    img.print(f32,40,35,snap.name+' ('+snap.symbol+')');
-    img.print(f64,40,90,(isProfit?'+':'')+pnlPct.toFixed(1)+'%');
-    img.print(f32,40,175,mult.toFixed(2)+'x');
-    img.print(f16,40,240,'Entry MC:   '+fmt(snap.mc));
-    img.print(f16,40,265,'Current MC: '+fmt(curMc));
-    img.print(f16,40,295,'Entry:   '+fmtPrice(snap.price));
-    img.print(f16,40,320,'Current: '+fmtPrice(cur));
-    const ago=Math.floor((Date.now()-snap.timestamp)/60000);
-    img.print(f16,40,360,'Tracked: '+(ago<60?ago+'m':Math.floor(ago/60)+'h '+ago%60+'m')+' ago');
-    img.print(f16,40,390,'@'+(username||'Anonymous'));
-    img.print(f16,W-220,H-25,'@YakubuWeb3Bot');
-    const fp='/tmp/pnl_'+Date.now()+'.png';
-    await img.writeAsync(fp);
-    await bot.deleteMessage(chatId,load.message_id);
-    await bot.sendPhoto(chatId,fp,{caption:'PNL — '+snap.name+' ('+snap.symbol+')\n\nEntry MC: '+fmt(snap.mc)+'\nCurrent MC: '+fmt(curMc)+'\n'+(isProfit?'🟢':'🔴')+' PNL: '+(isProfit?'+':'')+pnlPct.toFixed(1)+'%\nMultiplier: '+mult.toFixed(2)+'x\n\nPowered by @YakubuWeb3Bot',parse_mode:'Markdown'});
-    fs.unlinkSync(fp);
-  } catch(e) { try{await bot.deleteMessage(chatId,load.message_id);}catch(_){} bot.sendMessage(chatId,'❌ Error!'); console.error('sendPnl:',e.message); }
+    if (!p) { await bot.deleteMessage(chatId, loadMsg.message_id); return bot.sendMessage(chatId, 'Token not found!'); }
+    const currentPrice = parseFloat(p.priceUsd) || 0;
+    const currentMc    = p.fdv || 0;
+    const pnlPct       = ((currentPrice - snap.price) / snap.price) * 100;
+    const multiplier   = currentPrice / snap.price;
+    const isProfit     = pnlPct >= 0;
+    const imgPath = await generatePnlImage({ name: snap.name, symbol: snap.symbol, entryMc: snap.mc, currentMc, entryPrice: snap.price, currentPrice, pnlPct, multiplier, isProfit, username: username || 'Anonymous', entryTime: snap.timestamp });
+    await bot.deleteMessage(chatId, loadMsg.message_id);
+    await bot.sendPhoto(chatId, imgPath, { caption: 'PNL — ' + snap.name + ' (' + snap.symbol + ')\n\nEntry MC: ' + fmt(snap.mc) + '\nCurrent MC: ' + fmt(currentMc) + '\n' + (isProfit ? '🟢' : '🔴') + ' PNL: ' + (isProfit ? '+' : '') + pnlPct.toFixed(1) + '%\nMultiplier: ' + multiplier.toFixed(2) + 'x\n\nPowered by @YakubuWeb3Bot', parse_mode: 'Markdown' });
+    fs.unlinkSync(imgPath);
+  } catch(e) {
+    try { await bot.deleteMessage(chatId, loadMsg.message_id); } catch(err) {}
+    bot.sendMessage(chatId, 'Error generating PNL!');
+    console.error(e);
+  }
 }
 
-// ═══════════════════════════════════════════════
-//  WEEKLY REPORT
-// ═══════════════════════════════════════════════
-async function sendWeeklyReport() {
-  const s = getWeeklyStats();
-  if (!s) { bot.sendMessage(ADMIN_ID,'📊 No closed trades this week.'); return; }
-  await bot.sendMessage(CHANNEL_ID,
-    '*📊 WEEKLY SIGNAL REPORT*\n━━━━━━━━━━━━━━━━━━━\n\nLast 7 days:\n📈 Total: '+s.total+'\n✅ Wins: '+s.wins+'/'+s.total+'\n🎯 Win Rate: '+s.winRate+'%\n💰 PNL: '+(parseFloat(s.totalPnl)>0?'+':'')+s.totalPnl+' SOL\n'+(s.best?'🏆 Best: '+s.best.symbol+' +'+(s.best.pnl_pct||0).toFixed(1)+'%\n':'')+'\n_Signal by @YakubuWeb3_',
-    {parse_mode:'Markdown'});
-}
-function scheduleWeeklyReport() {
-  setInterval(()=>{const n=new Date();if(n.getDay()===0&&n.getHours()===8&&n.getMinutes()<15)sendWeeklyReport();},15*60*1000);
-}
-
-// ═══════════════════════════════════════════════
-//  /TRENDING COMMAND
-// ═══════════════════════════════════════════════
-bot.onText(/\/trending/, async msg => {
-  const chatId = msg.chat.id;
-  const load = await bot.sendMessage(chatId, '🔥 Fetching Solana trending tokens...');
-  try {
-    const tokens = await getTrendingTokens();
-    if (!tokens.length) { await bot.deleteMessage(chatId,load.message_id); return bot.sendMessage(chatId,'❌ Could not fetch trending tokens.'); }
-    const now = new Date().toUTCString();
-    let text = '🔥 *Solana Trending Tokens* 🔥\n_Updated: ' + now + '_\n\n';
-    tokens.slice(0,10).forEach((t,i) => {
-      text += (i+1) + '. *' + t.name + '* (' + t.symbol + ')\n';
-      text += '💊 MCap: ' + fmt(t.mc) + ' | 💧 Liq: ' + fmt(t.liq) + '\n';
-      text += '📈 Vol 24h: ' + fmt(t.vol24) + '\n';
-      text += '1h: ' + fmtPct(t.ch1h) + ' | 24h: ' + fmtPct(t.ch24) + '\n';
-      text += '[DEXScreener](' + t.url + ') | [Swap on Jupiter](https://jup.ag/swap/SOL-' + t.address + ')\n\n';
-    });
-    await bot.deleteMessage(chatId, load.message_id);
-    await bot.sendMessage(chatId, text, {
-      parse_mode:'Markdown', disable_web_page_preview:true,
-      reply_markup:{inline_keyboard:[[{text:'🔄 Refresh',callback_data:'trending_refresh'},{text:'📡 Get Signal',callback_data:'prompt_analyze'}]]}
-    });
-  } catch(e) { try{await bot.deleteMessage(chatId,load.message_id);}catch(_){} bot.sendMessage(chatId,'❌ Error fetching trending!'); }
-});
-
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 //  BOT COMMANDS
-// ═══════════════════════════════════════════════
-bot.onText(/\/start/, msg => {
-  bot.sendMessage(msg.chat.id,
-    '🚀 *YakubuWeb3 Signal Bot*\n\n' +
-    'Send any *Solana CA* to analyze!\n\n' +
-    '🔥 /trending — Hot Solana tokens\n' +
-    '📡 Auto-scan every 15 mins\n' +
-    '🎯 Targets: 1-12h | $20K-$500K MC\n\n' +
-    '/pnl <CA> — PNL Card\n' +
-    '/price <symbol> — Price\n' +
-    '/trending — Trending tokens\n' +
-    '/status — Bot Status\n' +
-    '/help — All Commands\n\n' +
-    '_Powered by @YakubuWeb3_',
-    {parse_mode:'Markdown',reply_markup:{inline_keyboard:[[{text:'🔥 Trending',callback_data:'trending_refresh'},{text:'📊 Analyze CA',callback_data:'prompt_analyze'}]]}}
-  );
+// ═══════════════════════════════════════════════════════════
+bot.onText(/\/start/, (msg) => {
+  bot.sendMessage(msg.chat.id, '🚀 *YakubuWeb3 Signal Bot*\n\nSend any *Solana CA* to analyze!\n\n📡 Auto-scans every 30 mins\n🎯 3-5 quality signals per day\n🐋 /submitwallet <address> — turo Smart Wallet, samu VIP kyauta\n\n/pnl <CA> — PNL Card\n/price <symbol> — Price\n/status — Bot status\n/help — Commands\n\n_Powered by @YakubuWeb3_', { parse_mode: 'Markdown', reply_markup: { inline_keyboard: [[{ text: 'Analyze Token', callback_data: 'prompt_analyze' }, { text: 'Price Check', callback_data: 'prompt_price' }]] } });
 });
 
-bot.onText(/\/help/, msg => {
-  const isAdmin = String(msg.chat.id)===String(ADMIN_ID);
-  bot.sendMessage(msg.chat.id,
-    '📋 *Commands:*\n\n' +
-    '🔥 /trending — Hot Solana tokens\n' +
-    'Send CA → Analyze\n' +
-    '/pnl <CA> — PNL Card\n' +
-    '/price <symbol> — Price\n' +
-    '/status — Status\n' +
-    (isAdmin?'\n👑 *Admin:*\n/scan — Manual scan\n/signal <CA> — Force signal\n/pending — View pending\n/stats — Stats\n/analytics — User analytics\n/clearcache — Clear scan cache\n/report — Weekly report':''),
-    {parse_mode:'Markdown'}
-  );
+bot.onText(/\/help/, (msg) => {
+  const isAdmin = String(msg.chat.id) === String(ADMIN_ID);
+  const adminCmds = isAdmin ? '\n\n👑 *Admin:*\n/signal <CA>\n/scan\n/pending\n/stats\n/wallets' : '';
+  bot.sendMessage(msg.chat.id, '📋 *Commands:*\n\nSend CA — Analyze\n/pnl <CA> — PNL Card\n/price <symbol> — Price\n/status\n/submitwallet <address> — Turo Smart Wallet\n/mystatus — Duba VIP status' + adminCmds, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/status/, msg => {
-  const cnt=getTodaySignalCount(), trades=getOpenTrades();
-  bot.sendMessage(msg.chat.id,
-    '📊 *Bot Status*\n\n✅ Running\n📡 Signals today: '+cnt+'/'+MAX_SIGNALS_PER_DAY+'\n📈 Open trades: '+trades.length+'\n\n⚙️ *Filters:*\n⏰ Age: '+MIN_AGE_HOURS+'-'+MAX_AGE_HOURS+'h\n💊 MC: '+fmt(MIN_MC)+'-'+fmt(MAX_MC)+'\n🎯 Score: '+SCORE_PASS_MIN+'+/100\n🔄 Scan: every 15 mins',
-    {parse_mode:'Markdown'});
+bot.onText(/\/status/, (msg) => {
+  const count = getTodaySignalCount();
+  bot.sendMessage(msg.chat.id, '📊 *Bot Status*\n\nSignals today: ' + count + '/' + MAX_SIGNALS_PER_DAY + '\nScan: Every 30 mins\nRunning!', { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/stats/, msg => {
-  if(String(msg.chat.id)!==String(ADMIN_ID)) return;
-  const rows=db.prepare('SELECT ca, token_name, token_symbol, saved_at FROM pending_signals ORDER BY saved_at DESC').all();
-  bot.sendMessage(ADMIN_ID,'📊 *Stats*\n\nToday: '+getTodaySignalCount()+'/'+MAX_SIGNALS_PER_DAY+'\nPending: '+rows.length+'\nOpen trades: '+getOpenTrades().length,{parse_mode:'Markdown'});
-});
-
-bot.onText(/\/scan/, async msg => { if(String(msg.chat.id)!==String(ADMIN_ID))return; await runScan(true); });
-
-bot.onText(/\/signal (.+)/, async (msg,match) => {
-  if(String(msg.chat.id)!==String(ADMIN_ID)) return bot.sendMessage(msg.chat.id,'❌ Admin only!');
-  const ca=match[1].trim();
-  const load=await bot.sendMessage(ADMIN_ID,'🔍 Fetching...');
-  const p=await getTokenData(ca);
-  if(!p){await bot.deleteMessage(ADMIN_ID,load.message_id);return bot.sendMessage(ADMIN_ID,'❌ Token not found!');}
-  const rug=await getRugcheck(ca);
-  const analysis=calcTokenStrength(p,rug);
-  await bot.deleteMessage(ADMIN_ID,load.message_id);
-  await sendSignalForReview(ca,p,rug,analysis,false);
-});
-
-bot.onText(/\/pending/, msg => {
-  if(String(msg.chat.id)!==String(ADMIN_ID)) return;
-  try {
-    const rows=db.prepare('SELECT ca, token_name, token_symbol, saved_at FROM pending_signals ORDER BY saved_at DESC').all();
-    if(!rows.length) return bot.sendMessage(ADMIN_ID,'📋 No pending signals.');
-    const list=rows.map((r,i)=>(i+1)+'. *'+r.token_name+'* ('+r.token_symbol+') — '+Math.floor((Date.now()-r.saved_at)/60000)+'m ago\n`'+r.ca+'`').join('\n\n');
-    bot.sendMessage(ADMIN_ID,'📋 *Pending ('+rows.length+'):*\n\n'+list,{parse_mode:'Markdown'});
-  } catch(e){bot.sendMessage(ADMIN_ID,'❌ Error.');}
-});
-
-bot.onText(/\/clearcache/, msg => {
-  if(String(msg.chat.id)!==String(ADMIN_ID)) return;
-  clearScannedTokens();
-  bot.sendMessage(ADMIN_ID,'✅ Scan cache cleared! All tokens fresh on next scan.');
-});
-
-bot.onText(/\/analytics/, async msg => {
+bot.onText(/\/stats/, (msg) => {
   if (String(msg.chat.id) !== String(ADMIN_ID)) return;
-  const dayUsers   = getActiveUsers(24*60*60*1000);
-  const weekUsers  = getActiveUsers(7*24*60*60*1000);
-  const monthUsers = getActiveUsers(30*24*60*60*1000);
-  const dayAn   = getAnalysesCount(24*60*60*1000);
-  const weekAn  = getAnalysesCount(7*24*60*60*1000);
-  const monthAn = getAnalysesCount(30*24*60*60*1000);
-  const totalUsers = getTotalUsers();
-  const top = getTopUsers(5);
-  let topText = top.length
-    ? top.map((u,i) => (i+1)+'. @'+(u.username||'anon')+' — '+u.total_analyses+' analyses').join('\n')
-    : 'No data yet';
-  bot.sendMessage(ADMIN_ID,
-    '📊 *Bot Analytics*\n━━━━━━━━━━━━━━━━━━━\n\n' +
-    '👥 *Active Users:*\n' +
-    '├ Today: ' + dayUsers + '\n' +
-    '├ This week: ' + weekUsers + '\n' +
-    '└ This month: ' + monthUsers + '\n\n' +
-    '🔍 *Analyses Run:*\n' +
-    '├ Today: ' + dayAn + '\n' +
-    '├ This week: ' + weekAn + '\n' +
-    '└ This month: ' + monthAn + '\n\n' +
-    '📈 *All-time users:* ' + totalUsers + '\n\n' +
-    '🏆 *Top Users:*\n' + topText,
-    { parse_mode: 'Markdown' }
-  );
+  const count   = getTodaySignalCount();
+  const pending = Object.keys(pendingSignals).length;
+  bot.sendMessage(ADMIN_ID, '📊 *Stats*\n\nToday: ' + count + '/' + MAX_SIGNALS_PER_DAY + '\nPending: ' + pending, { parse_mode: 'Markdown' });
 });
 
-bot.onText(/\/report/, async msg => { if(String(msg.chat.id)!==String(ADMIN_ID))return; await sendWeeklyReport(); });
-bot.onText(/\/pnl (.+)/, async (msg,match) => { await sendPnl(msg.chat.id,match[1].trim(),msg.from?.username); });
+bot.onText(/\/scan/, async (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  bot.sendMessage(ADMIN_ID, 'Starting manual scan...');
+  await runScan(true);
+});
 
-bot.onText(/\/price (.+)/, async (msg,match) => {
-  const chatId=msg.chat.id, sym=match[1].trim().toLowerCase();
-  const load=await bot.sendMessage(chatId,'⏳ Fetching price...');
+bot.onText(/\/signal (.+)/, async (msg, match) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return bot.sendMessage(msg.chat.id, 'Admin only!');
+  await sendSignalForReview(match[1].trim(), null, null, false, null);
+});
+
+bot.onText(/\/pending/, (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  const keys = Object.keys(pendingSignals);
+  if (keys.length === 0) return bot.sendMessage(ADMIN_ID, 'No pending signals.');
+  bot.sendMessage(ADMIN_ID, '📋 *Pending (' + keys.length + '):*\n\n' + keys.map((k, i) => (i + 1) + '. `' + k + '`').join('\n'), { parse_mode: 'Markdown' });
+});
+
+bot.onText(/\/analyze (.+)/, async (msg, match) => { await sendAnalysis(msg.chat.id, match[1].trim(), msg.from?.username); });
+bot.onText(/\/pnl (.+)/,     async (msg, match) => { await sendPnl(msg.chat.id, match[1].trim(), msg.from?.username); });
+
+bot.onText(/\/price (.+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  const symbol = match[1].trim().toLowerCase();
+  const loadMsg = await bot.sendMessage(chatId, 'Fetching price...');
   try {
-    const res=await axios.get('https://api.coingecko.com/api/v3/simple/price?ids='+sym+'&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true');
-    const d=res.data[sym];
-    if(!d){await bot.deleteMessage(chatId,load.message_id);return bot.sendMessage(chatId,'❌ Coin not found!');}
-    await bot.deleteMessage(chatId,load.message_id);
-    bot.sendMessage(chatId,'💰 *'+sym.toUpperCase()+'*\n\nPrice: '+fmtPrice(d.usd)+'\nMC: '+fmt(d.usd_market_cap)+'\nVol 24h: '+fmt(d.usd_24h_vol)+'\n'+fmtPct(d.usd_24h_change)+' (24h)\n\n_Powered by @YakubuWeb3_',{parse_mode:'Markdown'});
-  } catch(e){await bot.deleteMessage(chatId,load.message_id);bot.sendMessage(chatId,'❌ Error!');}
+    const res = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=' + symbol + '&vs_currencies=usd&include_24hr_change=true&include_market_cap=true&include_24hr_vol=true');
+    const data = res.data[symbol];
+    if (!data) { await bot.deleteMessage(chatId, loadMsg.message_id); return bot.sendMessage(chatId, 'Coin not found!'); }
+    await bot.deleteMessage(chatId, loadMsg.message_id);
+    bot.sendMessage(chatId, '💰 *' + symbol.toUpperCase() + '*\n\nPrice: ' + fmtPrice(data.usd) + '\nMC: ' + fmt(data.usd_market_cap) + '\nVol (24h): ' + fmt(data.usd_24h_vol) + '\n' + fmtChangeEmoji(data.usd_24h_change) + ' (24h)\n\n_Powered by @YakubuWeb3_', { parse_mode: 'Markdown' });
+  } catch(e) { await bot.deleteMessage(chatId, loadMsg.message_id); bot.sendMessage(chatId, 'Error!'); }
 });
 
-bot.on('message', async msg => {
-  if(!msg.text||msg.text.startsWith('/')) return;
-  const ca=msg.text.trim();
-  if(/^[A-Za-z0-9]{32,50}$/.test(ca)) await sendAnalysis(msg.chat.id,ca,msg.from?.username);
+// ── NEW: Crowdsourced Wallet Submission Commands ─────────────
+bot.onText(/\/submitwallet (.+)/, (msg, match) => {
+  const chatId = msg.chat.id;
+  const address = match[1].trim();
+  if (!(address.length >= 32 && address.length <= 44 && /^[1-9A-HJ-NP-Za-km-z]+$/.test(address))) {
+    return bot.sendMessage(chatId, '⚠️ Adireshin wallet ba daidai ba ne! Sai a sake duba Solana wallet address.');
+  }
+  addWalletSubmission(address, 'crowdsourced', String(chatId));
+  bot.sendMessage(chatId, '✅ Mun karɓi wallet ɗinka!\n\nZa mu duba tarihinta (verification) cikin ƴan mintuna. Idan ta tabbata, za mu baka kwana ' + PREMIUM_REWARD_DAYS + ' na VIP Premium kyauta. Hakuri kaɗan!');
 });
 
-// ═══════════════════════════════════════════════
-//  CALLBACKS
-// ═══════════════════════════════════════════════
-bot.on('callback_query', async query => {
-  const chatId=query.message.chat.id, msgId=query.message.message_id, data=query.data, username=query.from?.username;
+bot.onText(/\/mystatus/, (msg) => {
+  const chatId = msg.chat.id;
+  const premium = isPremium(chatId);
+  if (premium) {
+    const row = db.prepare('SELECT * FROM premium_users WHERE telegram_id = ?').get(String(chatId));
+    const daysLeft = Math.ceil((row.expires_at - Date.now()) / (24 * 60 * 60 * 1000));
+    bot.sendMessage(chatId, '⭐ Kana da VIP Premium! Ya rage kwana ' + daysLeft + '.');
+  } else {
+    bot.sendMessage(chatId, 'Ba ka da VIP Premium a yanzu.\n\nYi amfani da /submitwallet <address> domin samun damar samun kwana ' + PREMIUM_REWARD_DAYS + ' kyauta idan wallet ɗinka ta tabbata (verified).');
+  }
+});
 
-  if(data==='trending_refresh') {
-    await bot.answerCallbackQuery(query.id,{text:'Fetching trending...'});
-    try{await bot.deleteMessage(chatId,msgId);}catch(_){}
-    const load=await bot.sendMessage(chatId,'🔥 Refreshing trending...');
-    try {
-      const tokens=await getTrendingTokens();
-      const now=new Date().toUTCString();
-      let text='🔥 *Solana Trending Tokens* 🔥\n_Updated: '+now+'_\n\n';
-      tokens.slice(0,10).forEach((t,i)=>{
-        text+=(i+1)+'. *'+t.name+'* ('+t.symbol+')\n';
-        text+='💊 MCap: '+fmt(t.mc)+' | 💧 Liq: '+fmt(t.liq)+'\n';
-        text+='📈 Vol 24h: '+fmt(t.vol24)+'\n';
-        text+='1h: '+fmtPct(t.ch1h)+' | 24h: '+fmtPct(t.ch24)+'\n';
-        text+='[DEXScreener]('+t.url+') | [Swap on Jupiter](https://jup.ag/swap/SOL-'+t.address+')\n\n';
-      });
-      await bot.deleteMessage(chatId,load.message_id);
-      await bot.sendMessage(chatId,text,{parse_mode:'Markdown',disable_web_page_preview:true,reply_markup:{inline_keyboard:[[{text:'🔄 Refresh',callback_data:'trending_refresh'},{text:'📡 Get Signal',callback_data:'prompt_analyze'}]]}});
-    } catch(e){try{await bot.deleteMessage(chatId,load.message_id);}catch(_){}bot.sendMessage(chatId,'❌ Error!');}
+bot.onText(/\/wallets/, (msg) => {
+  if (String(msg.chat.id) !== String(ADMIN_ID)) return;
+  const verified = getVerifiedWallets();
+  if (verified.length === 0) return bot.sendMessage(ADMIN_ID, 'Babu wallet verified tukuna.');
+  const list = verified.slice(0, 20).map((w, i) => (i + 1) + '. `' + w.address.slice(0, 6) + '...' + w.address.slice(-4) + '` — ' + w.win_rate.toFixed(0) + '% win rate (' + w.source + ')').join('\n');
+  bot.sendMessage(ADMIN_ID, '🐋 *Verified Smart Wallets (' + verified.length + '):*\n\n' + list, { parse_mode: 'Markdown' });
+});
+
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const text = msg.text || '';
+  if (text.startsWith('/')) return;
+  const ca = text.trim();
+  if (ca.length >= 32 && ca.length <= 44 && /^[A-Za-z0-9]+$/.test(ca)) await sendAnalysis(chatId, ca, msg.from?.username);
+});
+
+// ═══════════════════════════════════════════════════════════
+//  CALLBACK QUERIES
+// ═══════════════════════════════════════════════════════════
+bot.on('callback_query', async (query) => {
+  const chatId   = query.message.chat.id;
+  const msgId    = query.message.message_id;
+  const data     = query.data;
+  const username = query.from?.username;
+
+  if (data.startsWith('signal_')) {
+    if (String(chatId) !== String(ADMIN_ID)) return bot.answerCallbackQuery(query.id, { text: 'Admin only!' });
+    await bot.answerCallbackQuery(query.id, { text: 'Preparing signal...' });
+    await sendSignalForReview(data.replace('signal_', ''), null, null, false, null);
     return;
   }
-  if(data.startsWith('approve_')){
-    if(String(chatId)!==String(ADMIN_ID)) return bot.answerCallbackQuery(query.id,{text:'Admin only!'});
-    await bot.answerCallbackQuery(query.id,{text:'Posting...'});
-    await postToChannel(data.replace('approve_',''),msgId); return;
+  if (data.startsWith('approve_')) {
+    if (String(chatId) !== String(ADMIN_ID)) return bot.answerCallbackQuery(query.id, { text: 'Admin only!' });
+    await bot.answerCallbackQuery(query.id, { text: 'Posting to channel...' });
+    await postSignalToChannel(data.replace('approve_', ''), msgId);
+    return;
   }
-  if(data.startsWith('reject_')){
-    if(String(chatId)!==String(ADMIN_ID)) return bot.answerCallbackQuery(query.id,{text:'Admin only!'});
-    const ca=data.replace('reject_','');
-    deletePendingSignal(ca);
-    await bot.answerCallbackQuery(query.id,{text:'Rejected!'});
-    await bot.editMessageText('❌ Signal rejected.\nCA: `'+ca+'`',{chat_id:ADMIN_ID,message_id:msgId,parse_mode:'Markdown'}); return;
+  if (data.startsWith('reject_')) {
+    if (String(chatId) !== String(ADMIN_ID)) return bot.answerCallbackQuery(query.id, { text: 'Rejected!' });
+    const ca = data.replace('reject_', '');
+    delete pendingSignals[ca];
+    await bot.answerCallbackQuery(query.id, { text: 'Signal rejected!' });
+    await bot.editMessageText('Signal rejected.\nCA: `' + ca + '`', { chat_id: ADMIN_ID, message_id: msgId, parse_mode: 'Markdown' });
+    return;
   }
-  if(data.startsWith('signal_')){
-    if(String(chatId)!==String(ADMIN_ID)) return bot.answerCallbackQuery(query.id,{text:'Admin only!'});
-    await bot.answerCallbackQuery(query.id,{text:'Preparing...'});
-    const ca=data.replace('signal_','');
-    const p=await getTokenData(ca);
-    if(!p) return bot.sendMessage(ADMIN_ID,'❌ Token not found!');
-    const rug=await getRugcheck(ca), analysis=calcTokenStrength(p,rug);
-    await sendSignalForReview(ca,p,rug,analysis,false); return;
+  if (data.startsWith('refresh_')) {
+    const ca = data.replace('refresh_', '');
+    await bot.answerCallbackQuery(query.id, { text: 'Refreshing...' });
+    try {
+      const p = await getTokenData(ca);
+      if (!p) return;
+      const text = await formatMsg(p, ca, chatId);
+      const isAdmin = String(chatId) === String(ADMIN_ID);
+      const keyboard = isAdmin
+        ? [[{ text: 'Refresh', callback_data: 'refresh_' + ca }, { text: 'Delete', callback_data: 'delete' }, { text: 'Chart', url: 'https://dexscreener.com/solana/' + ca }],[{ text: 'PNL Card', callback_data: 'pnl_' + ca }, { text: 'Send as Signal', callback_data: 'signal_' + ca }]]
+        : [[{ text: 'Refresh', callback_data: 'refresh_' + ca }, { text: 'Delete', callback_data: 'delete' }, { text: 'Chart', url: 'https://dexscreener.com/solana/' + ca }],[{ text: 'PNL Card', callback_data: 'pnl_' + ca }]];
+      await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'Markdown', disable_web_page_preview: true, reply_markup: { inline_keyboard: keyboard } });
+    } catch(e) { bot.answerCallbackQuery(query.id, { text: 'Error!' }); }
+    return;
   }
-  if(data.startsWith('refresh_')){
-    const ca=data.replace('refresh_','');
-    await bot.answerCallbackQuery(query.id,{text:'Refreshing...'});
-    try{await bot.deleteMessage(chatId,msgId);}catch(_){}
-    await sendAnalysis(chatId,ca,username); return;
-  }
-  if(data.startsWith('pnl_')){await bot.answerCallbackQuery(query.id,{text:'Generating...'}); await sendPnl(chatId,data.replace('pnl_',''),username); return;}
-  if(data==='delete'){await bot.deleteMessage(chatId,msgId);await bot.answerCallbackQuery(query.id,{text:'Deleted!'});return;}
-  if(data==='prompt_analyze'){await bot.answerCallbackQuery(query.id);bot.sendMessage(chatId,'Send any Solana CA!');return;}
-  if(data==='prompt_price'){await bot.answerCallbackQuery(query.id);bot.sendMessage(chatId,'Use: /price solana');return;}
+  if (data.startsWith('pnl_')) { await bot.answerCallbackQuery(query.id, { text: 'Generating PNL...' }); await sendPnl(chatId, data.replace('pnl_', ''), username); return; }
+  if (data === 'delete')        { await bot.deleteMessage(chatId, msgId); await bot.answerCallbackQuery(query.id, { text: 'Deleted!' }); return; }
+  if (data === 'prompt_analyze') { await bot.answerCallbackQuery(query.id); bot.sendMessage(chatId, 'Send any Solana CA directly!'); return; }
+  if (data === 'prompt_price')   { await bot.answerCallbackQuery(query.id); bot.sendMessage(chatId, 'Send: /price solana', { parse_mode: 'Markdown' }); return; }
 });
 
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
 //  STARTUP
-// ═══════════════════════════════════════════════
-cleanOldPending();
-clearScannedTokens();
+// ═══════════════════════════════════════════════════════════
+console.log('YakubuWeb3Bot is running!');
+console.log('Road Map 1 + 2 active');
+console.log('DEX Analysis Engine: ON');
+console.log('Wallet Tracking + Crowdsourcing: ON');
+console.log('AI Explanation Layer: ' + (ANTHROPIC_API_KEY ? 'ON' : 'OFF (saita ANTHROPIC_API_KEY)'));
+console.log('First scan in 1 minute, then every 30 minutes');
 
-console.log('================================');
-console.log('  YakubuWeb3Bot — STARTED');
-console.log('  Age: '+MIN_AGE_HOURS+'-'+MAX_AGE_HOURS+'h | MC: $'+MIN_MC/1000+'K-$'+MAX_MC/1000+'K');
-console.log('  Score: '+SCORE_PASS_MIN+'+ | Scan: 15mins');
-console.log('================================');
+setTimeout(() => {
+  runScan(true);
+  setInterval(runScan, SCAN_INTERVAL_MS);
+}, 60 * 1000);
 
-bot.sendMessage(ADMIN_ID,
-  '🚀 *Bot Started!*\n\n' +
-  '⏰ Age: '+MIN_AGE_HOURS+'-'+MAX_AGE_HOURS+'h\n' +
-  '💊 MC: '+fmt(MIN_MC)+' - '+fmt(MAX_MC)+'\n' +
-  '🔄 Scan: every 15 mins\n' +
-  '🔥 New: /trending command!\n\n' +
-  'First scan in 1 minute...',
-  {parse_mode:'Markdown'}
-);
-
-setTimeout(()=>runScan(false), 60*1000);
-setInterval(()=>runScan(false), SCAN_INTERVAL_MS);
-setInterval(checkOpenTrades, 10*60*1000);
+setInterval(checkOpenTrades, 15 * 60 * 1000);
 scheduleWeeklyReport();
 
-// Update bot bio with monthly user count — every 6 hours
-setTimeout(updateBotBio, 30 * 1000);
-setInterval(updateBotBio, 6 * 60 * 60 * 1000);
+initGramListener();
+setTimeout(processWalletSubmissions, 90 * 1000);
+setInterval(processWalletSubmissions, SUBMISSION_CHECK_INTERVAL_MS);
+setTimeout(monitorSmartWallets, 120 * 1000);
+setInterval(monitorSmartWallets, WALLET_CHECK_INTERVAL_MS);
