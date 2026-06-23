@@ -1,0 +1,18 @@
+{
+  "name": "yakubuweb3-bot",
+  "version": "1.0.0",
+  "description": "Solana Trading Bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.0.0",
+    "@solana/web3.js": "^1.87.0",
+    "jimp": "^0.22.12",
+    "better-sqlite3": "^9.4.3",
+    "telegram": "^2.26.22"
+  }
+}
